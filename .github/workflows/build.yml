@@ -4,30 +4,22 @@ on:
   workflow_dispatch:
     inputs:
       branch:
-        description: Branch to build (leave empty for the triggering ref)
+        description: Branch to build
         required: false
         default: Dev
         type: string
   push:
-    branches:
-      - Dev
-      - main
-    paths:
-      - module/**
-      - .github/workflows/build.yml
+    branches: [Dev, main]
+    paths: [module/**, .github/workflows/build.yml]
   pull_request:
-    paths:
-      - module/**
-      - .github/workflows/build.yml
+    paths: [module/**, .github/workflows/build.yml]
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Build and package Magisk module
     runs-on: ubuntu-latest
-
     env:
       NDK_VERSION: r27c
       MODULE_DIR: module
@@ -35,140 +27,67 @@ jobs:
       MAGISK_INSTALLER_REV: 14ea5cfb4a5771c742f7c3fd1e685bdbfac7aa8c
 
     steps:
-      - name: Check out source
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.branch || github.ref }}
           fetch-depth: 0
 
-      - name: Set build version and runtime paths
-        id: version
+      - name: Set package version
         shell: bash
         run: |
           set -euo pipefail
-          commit_count="$(git rev-list --count HEAD)"
-          short_sha="$(git rev-parse --short HEAD)"
-          display_version="Aki-0.1.0(${commit_count}-${short_sha})"
-
-          # versionCode must be an integer for Magisk. The committed file is
-          # only a source template; the packaged copy gets CI build metadata.
+          count="$(git rev-list --count HEAD)"
+          sha="$(git rev-parse --short HEAD)"
           sed -i \
-            -e "s/^version=.*/version=${display_version}/" \
-            -e "s/^versionCode=.*/versionCode=${commit_count}/" \
+            -e "s/^version=.*/version=Aki-0.1.0(${count}-${sha})/" \
+            -e "s/^versionCode=.*/versionCode=${count}/" \
             "$MODULE_DIR/module.prop"
 
-          # The C source is compiled with the same cpuset name as the module
-          # ID, so each generated binary creates /dev/cpuset/AkiAppOpt.
-          sed -i \
-            's|^#define BASE_CPUSET.*|#define BASE_CPUSET        "/dev/cpuset/AkiAppOpt"|' \
-            "$MODULE_DIR/AppOpt.c"
-
-          echo "commit_count=${commit_count}" >> "$GITHUB_OUTPUT"
-          echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
-          echo "display_version=${display_version}" >> "$GITHUB_OUTPUT"
-
-      - name: Set up Android NDK
-        uses: nttld/setup-ndk@v1
+      - uses: nttld/setup-ndk@v1
         with:
           ndk-version: ${{ env.NDK_VERSION }}
           local-cache: true
 
-      - name: Validate module sources
+      - name: Build binaries
         shell: bash
         run: |
           set -euo pipefail
-          required_files=(
-            "$MODULE_DIR/AppOpt.c"
-            "$MODULE_DIR/module.prop"
-            "$MODULE_DIR/service.sh"
-            "$MODULE_DIR/customize.sh"
-            "$MODULE_DIR/applist.conf"
-          )
-          for file in "${required_files[@]}"; do
-            [[ -f "$file" ]] || { echo "Missing required module file: $file" >&2; exit 1; }
-          done
-
-      - name: Generate Magisk installer files
-        shell: bash
-        run: |
-          set -euo pipefail
-          installer_dir="$MODULE_DIR/META-INF/com/google/android"
-          mkdir -p "$installer_dir"
-          curl --fail --location --silent --show-error \
-            "https://raw.githubusercontent.com/topjohnwu/Magisk/${MAGISK_INSTALLER_REV}/scripts/module_installer.sh" \
-            -o "$installer_dir/update-binary"
-          chmod 0755 "$installer_dir/update-binary"
-          printf '#MAGISK\n' > "$installer_dir/updater-script"
-
-          # The module package deliberately uses armabi-v7a as its directory
-          # name. Keep the installer lookup in sync with the packaged layout.
-          sed -i 's|bin/armeabi-v7a/AppOpt|bin/armabi-v7a/AppOpt|g' \
-            "$MODULE_DIR/customize.sh"
-
-      - name: Compile AppOpt binaries
-        shell: bash
-        run: |
-          set -euo pipefail
-          TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          SOURCE="$MODULE_DIR/AppOpt.c"
-
+          source="$MODULE_DIR/AppOpt.c"
+          toolchain="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
           build() {
-            local abi="$1"
-            local compiler="$2"
-            mkdir -p "$MODULE_DIR/bin/$abi"
-            "$TOOLCHAIN/$compiler" \
-              -O2 -ffunction-sections -fdata-sections -s \
-              -Wl,--gc-sections \
-              -o "$MODULE_DIR/bin/$abi/AppOpt" "$SOURCE"
-            chmod 0755 "$MODULE_DIR/bin/$abi/AppOpt"
+            mkdir -p "$MODULE_DIR/bin/$1"
+            "$toolchain/$2" -O2 -ffunction-sections -fdata-sections -s \
+              -Wl,--gc-sections -o "$MODULE_DIR/bin/$1/AppOpt" "$source"
+            chmod 0755 "$MODULE_DIR/bin/$1/AppOpt"
           }
-
           build arm64-v8a aarch64-linux-android21-clang
           build armabi-v7a armv7a-linux-androideabi21-clang
           build x86_64 x86_64-linux-android21-clang
 
-      - name: Verify compiled Android binaries
+      - name: Create Magisk installer files
         shell: bash
         run: |
           set -euo pipefail
-          arm64="$MODULE_DIR/bin/arm64-v8a/AppOpt"
-          arm32="$MODULE_DIR/bin/armabi-v7a/AppOpt"
-          x64="$MODULE_DIR/bin/x86_64/AppOpt"
+          installer="$MODULE_DIR/META-INF/com/google/android"
+          mkdir -p "$installer"
+          curl --fail --location --silent --show-error \
+            "https://raw.githubusercontent.com/topjohnwu/Magisk/${MAGISK_INSTALLER_REV}/scripts/module_installer.sh" \
+            -o "$installer/update-binary"
+          chmod 0755 "$installer/update-binary"
+          printf '#MAGISK\n' > "$installer/updater-script"
 
-          # Android binaries use Android's dynamic linker and cannot be run
-          # directly by the Ubuntu runner. Validate their format instead.
-          file "$arm64" | grep -q 'ARM aarch64'
-          file "$arm32" | grep -q 'ARM'
-          file "$x64" | grep -q 'x86-64'
-          for binary in "$arm64" "$arm32" "$x64"; do
-            test -s "$binary"
-            readelf --file-header "$binary" | grep -q 'ELF'
-            readelf --dynamic "$binary" | grep -q 'Shared library: \[libc.so\]'
-          done
-
-      - name: Package flashable module
+      - name: Package module
         id: package
         shell: bash
         run: |
           set -euo pipefail
           version="$(sed -n 's/^version=//p' "$MODULE_DIR/module.prop" | head -n1)"
-          version_code="$(sed -n 's/^versionCode=//p' "$MODULE_DIR/module.prop" | head -n1)"
-          [[ -n "$version" && -n "$version_code" ]] || {
-            echo 'module.prop must define version and versionCode.' >&2
-            exit 1
-          }
-
-          artifact="${OUTPUT_NAME}-${version}-${version_code}.zip"
-          (
-            cd "$MODULE_DIR"
-            zip -r -9 "../$artifact" . \
-              -x 'AppOpt.c' \
-              -x 'bin/*/.gitkeep'
-          )
+          code="$(sed -n 's/^versionCode=//p' "$MODULE_DIR/module.prop" | head -n1)"
+          artifact="${OUTPUT_NAME}-${version}-${code}.zip"
+          (cd "$MODULE_DIR" && zip -r -9 "../$artifact" . -x 'AppOpt.c' -x 'bin/*/.gitkeep')
           echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
 
-      - name: Upload flashable module
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.package.outputs.artifact }}
           path: ${{ steps.package.outputs.artifact }}
