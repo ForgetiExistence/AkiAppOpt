@@ -1,44 +1,170 @@
-name: Build AppOpt
+name: Build AppOpt Magisk Module
 
 on:
   workflow_dispatch:
     inputs:
       branch:
-        description: 'Branch to build'
-        required: true
-        default: 'Dev'
+        description: Branch to build (leave empty for the triggering ref)
+        required: false
+        default: Dev
         type: string
+  push:
+    branches:
+      - Dev
+      - main
+    paths:
+      - module/**
+      - .github/workflows/build.yml
+  pull_request:
+    paths:
+      - module/**
+      - .github/workflows/build.yml
+
+permissions:
+  contents: read
 
 jobs:
   build:
+    name: Build and package Magisk module
     runs-on: ubuntu-latest
+
+    env:
+      NDK_VERSION: r27c
+      MODULE_DIR: module
+      OUTPUT_NAME: AppOpt
+      MAGISK_INSTALLER_REV: 14ea5cfb4a5771c742f7c3fd1e685bdbfac7aa8c
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out source
+        uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.branch }}
+          ref: ${{ inputs.branch || github.ref }}
+          fetch-depth: 0
 
-      - name: Setup Android NDK
+      - name: Set build version
+        id: version
+        shell: bash
         run: |
-          NDK_VERSION="r27c"
-          NDK_URL="https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
-          curl -sL -o ndk.zip "$NDK_URL"
-          unzip -q ndk.zip
-          echo "NDK_ROOT=$PWD/android-ndk-${NDK_VERSION}" >> $GITHUB_ENV
+          set -euo pipefail
+          commit_count="$(git rev-list --count HEAD)"
+          short_sha="$(git rev-parse --short HEAD)"
+          display_version="Aki-0.1.0(${commit_count}-${short_sha})"
 
-      - name: Build arm64-v8a
+          # versionCode must be an integer for Magisk. The committed file is
+          # only a source template; the packaged copy gets CI build metadata.
+          sed -i \
+            -e "s/^version=.*/version=${display_version}/" \
+            -e "s/^versionCode=.*/versionCode=${commit_count}/" \
+            "$MODULE_DIR/module.prop"
+
+          echo "commit_count=${commit_count}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "display_version=${display_version}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          local-cache: true
+
+      - name: Validate module sources
+        shell: bash
         run: |
-          $NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang \
-            -O2 -s -static -o AppOpt-arm64-v8a AppOpt.c
+          set -euo pipefail
+          required_files=(
+            "$MODULE_DIR/AppOpt.c"
+            "$MODULE_DIR/module.prop"
+            "$MODULE_DIR/service.sh"
+            "$MODULE_DIR/customize.sh"
+            "$MODULE_DIR/applist.conf"
+          )
+          for file in "${required_files[@]}"; do
+            [[ -f "$file" ]] || { echo "Missing required module file: $file" >&2; exit 1; }
+          done
 
-      - name: Build armeabi-v7a
+      - name: Generate Magisk installer files
+        shell: bash
         run: |
-          $NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang \
-            -O2 -s -static -o AppOpt-armeabi-v7a AppOpt.c
+          set -euo pipefail
+          installer_dir="$MODULE_DIR/META-INF/com/google/android"
+          mkdir -p "$installer_dir"
+          curl --fail --location --silent --show-error \
+            "https://raw.githubusercontent.com/topjohnwu/Magisk/${MAGISK_INSTALLER_REV}/scripts/module_installer.sh" \
+            -o "$installer_dir/update-binary"
+          chmod 0755 "$installer_dir/update-binary"
+          printf '#MAGISK\n' > "$installer_dir/updater-script"
 
-      - name: Upload artifacts
+          # The module package deliberately uses armabi-v7a as its directory
+          # name. Keep the installer lookup in sync with the packaged layout.
+          sed -i 's|bin/armeabi-v7a/AppOpt|bin/armabi-v7a/AppOpt|g' \
+            "$MODULE_DIR/customize.sh"
+
+      - name: Compile AppOpt binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          SOURCE="$MODULE_DIR/AppOpt.c"
+
+          build() {
+            local abi="$1"
+            local compiler="$2"
+            mkdir -p "$MODULE_DIR/bin/$abi"
+            "$TOOLCHAIN/$compiler" \
+              -O2 -ffunction-sections -fdata-sections -s \
+              -Wl,--gc-sections \
+              -o "$MODULE_DIR/bin/$abi/AppOpt" "$SOURCE"
+            chmod 0755 "$MODULE_DIR/bin/$abi/AppOpt"
+          }
+
+          build arm64-v8a aarch64-linux-android21-clang
+          build armabi-v7a armv7a-linux-androideabi21-clang
+          build x86_64 x86_64-linux-android21-clang
+
+      - name: Verify compiled Android binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          arm64="$MODULE_DIR/bin/arm64-v8a/AppOpt"
+          arm32="$MODULE_DIR/bin/armabi-v7a/AppOpt"
+          x64="$MODULE_DIR/bin/x86_64/AppOpt"
+
+          # Android binaries use Android's dynamic linker and cannot be run
+          # directly by the Ubuntu runner. Validate their format instead.
+          file "$arm64" | grep -q 'ARM aarch64'
+          file "$arm32" | grep -q 'ARM'
+          file "$x64" | grep -q 'x86-64'
+          for binary in "$arm64" "$arm32" "$x64"; do
+            test -s "$binary"
+            readelf --file-header "$binary" | grep -q 'ELF'
+            readelf --dynamic "$binary" | grep -q 'Shared library: \[libc.so\]'
+          done
+
+      - name: Package flashable module
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version=//p' "$MODULE_DIR/module.prop" | head -n1)"
+          version_code="$(sed -n 's/^versionCode=//p' "$MODULE_DIR/module.prop" | head -n1)"
+          [[ -n "$version" && -n "$version_code" ]] || {
+            echo 'module.prop must define version and versionCode.' >&2
+            exit 1
+          }
+
+          artifact="${OUTPUT_NAME}-${version}-${version_code}.zip"
+          (
+            cd "$MODULE_DIR"
+            zip -r -9 "../$artifact" . \
+              -x 'AppOpt.c' \
+              -x 'bin/*/.gitkeep'
+          )
+          echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
+
+      - name: Upload flashable module
         uses: actions/upload-artifact@v4
         with:
-          name: AppOpt-${{ github.event.inputs.branch }}
-          path: |
-            AppOpt-arm64-v8a
-            AppOpt-armeabi-v7a
+          name: ${{ steps.package.outputs.artifact }}
+          path: ${{ steps.package.outputs.artifact }}
+          if-no-files-found: error
+          retention-days: 14
