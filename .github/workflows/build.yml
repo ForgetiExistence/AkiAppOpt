@@ -41,7 +41,7 @@ jobs:
           ref: ${{ inputs.branch || github.ref }}
           fetch-depth: 0
 
-      - name: Set build version
+      - name: Set build version and runtime paths
         id: version
         shell: bash
         run: |
@@ -56,6 +56,12 @@ jobs:
             -e "s/^version=.*/version=${display_version}/" \
             -e "s/^versionCode=.*/versionCode=${commit_count}/" \
             "$MODULE_DIR/module.prop"
+
+          # The C source is compiled with the same cpuset name as the module
+          # ID, so each generated binary creates /dev/cpuset/AkiAppOpt.
+          sed -i \
+            's|^#define BASE_CPUSET.*|#define BASE_CPUSET        "/dev/cpuset/AkiAppOpt"|' \
+            "$MODULE_DIR/AppOpt.c"
 
           echo "commit_count=${commit_count}" >> "$GITHUB_OUTPUT"
           echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
