@@ -1,44 +1,95 @@
-name: Build AppOpt
+name: Build AppOpt Magisk Module
 
 on:
   workflow_dispatch:
     inputs:
       branch:
-        description: 'Branch to build'
-        required: true
-        default: 'Dev'
+        description: Branch to build
+        required: false
+        default: Dev
         type: string
+  push:
+    branches: [Dev, main]
+    paths: [module/**, .github/workflows/build.yml]
+  pull_request:
+    paths: [module/**, .github/workflows/build.yml]
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      NDK_VERSION: r27c
+      MODULE_DIR: module
+      OUTPUT_NAME: AppOpt
+      MAGISK_INSTALLER_REV: 14ea5cfb4a5771c742f7c3fd1e685bdbfac7aa8c
+
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.branch }}
+          ref: ${{ inputs.branch || github.ref }}
+          fetch-depth: 0
 
-      - name: Setup Android NDK
+      - name: Set package version
+        shell: bash
         run: |
-          NDK_VERSION="r27c"
-          NDK_URL="https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
-          curl -sL -o ndk.zip "$NDK_URL"
-          unzip -q ndk.zip
-          echo "NDK_ROOT=$PWD/android-ndk-${NDK_VERSION}" >> $GITHUB_ENV
+          set -euo pipefail
+          count="$(git rev-list --count HEAD)"
+          sha="$(git rev-parse --short HEAD)"
+          sed -i \
+            -e "s/^version=.*/version=Aki-0.1.0(${count}-${sha})/" \
+            -e "s/^versionCode=.*/versionCode=${count}/" \
+            "$MODULE_DIR/module.prop"
 
-      - name: Build arm64-v8a
-        run: |
-          $NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang \
-            -O2 -s -static -o AppOpt-arm64-v8a AppOpt.c
-
-      - name: Build armeabi-v7a
-        run: |
-          $NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang \
-            -O2 -s -static -o AppOpt-armeabi-v7a AppOpt.c
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      - uses: nttld/setup-ndk@v1
         with:
-          name: AppOpt-${{ github.event.inputs.branch }}
-          path: |
-            AppOpt-arm64-v8a
-            AppOpt-armeabi-v7a
+          ndk-version: ${{ env.NDK_VERSION }}
+          local-cache: true
+
+      - name: Build binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          source="$MODULE_DIR/AppOpt.c"
+          toolchain="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          build() {
+            mkdir -p "$MODULE_DIR/bin/$1"
+            "$toolchain/$2" -O2 -ffunction-sections -fdata-sections -s \
+              -Wl,--gc-sections -o "$MODULE_DIR/bin/$1/AppOpt" "$source"
+            chmod 0755 "$MODULE_DIR/bin/$1/AppOpt"
+          }
+          build arm64-v8a aarch64-linux-android21-clang
+          build armabi-v7a armv7a-linux-androideabi21-clang
+          build x86_64 x86_64-linux-android21-clang
+
+      - name: Create Magisk installer files
+        shell: bash
+        run: |
+          set -euo pipefail
+          installer="$MODULE_DIR/META-INF/com/google/android"
+          mkdir -p "$installer"
+          curl --fail --location --silent --show-error \
+            "https://raw.githubusercontent.com/topjohnwu/Magisk/${MAGISK_INSTALLER_REV}/scripts/module_installer.sh" \
+            -o "$installer/update-binary"
+          chmod 0755 "$installer/update-binary"
+          printf '#MAGISK\n' > "$installer/updater-script"
+
+      - name: Package module
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version=//p' "$MODULE_DIR/module.prop" | head -n1)"
+          code="$(sed -n 's/^versionCode=//p' "$MODULE_DIR/module.prop" | head -n1)"
+          artifact="${OUTPUT_NAME}-${version}-${code}.zip"
+          (cd "$MODULE_DIR" && zip -r -9 "../$artifact" . -x 'AppOpt.c' -x 'bin/*/.gitkeep')
+          echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.artifact }}
+          path: ${{ steps.package.outputs.artifact }}
+          if-no-files-found: error
+          retention-days: 14
