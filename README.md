@@ -102,7 +102,7 @@ com.miHoYo.Yuanshen{RenderThread}=6-7
 刷入后 Magisk 模块目录：
 
 ```
-/data/adb/modules/AppOpt/
+/data/adb/modules/AkiAppOpt/
 ├── bin/
 │   ├── arm64-v8a/AppOpt
 │   ├── armabi-v7a/AppOpt
@@ -119,7 +119,7 @@ com.miHoYo.Yuanshen{RenderThread}=6-7
 
 ```
 ┌─────────────┐     ┌──────────────┐     ┌─────────────────────┐
-│ applist.conf │ ──▶ │ 规则解析器    │ ──▶ │ /dev/cpuset/AppOpt/ │
+│ applist.conf │ ──▶ │ 规则解析器    │ ──▶ │ /dev/cpuset/AkiAppOPt/ │
 └─────────────┘     └──────────────┘     │   ├── 4-6/           │
                                          │   ├── 7/             │
        ┌─────────────────────┐           │   └── 6-7/           │
@@ -132,7 +132,7 @@ com.miHoYo.Yuanshen{RenderThread}=6-7
 └──────────┘     └──────────────┘     └───────────────────────┘
 ```
 
-1. 服务启动时解析 `applist.conf`，在 `/dev/cpuset/AppOpt/` 下创建对应 cpuset 分组
+1. 服务启动时解析 `applist.conf`，在 `/dev/cpuset/AkiAppOPt/` 下创建对应 cpuset 分组
 2. 周期性扫描 `/proc`，通过 PID 跟踪与增量扫描机制降低开销
 3. 将匹配线程的 PID 写入对应 cpuset 的 `tasks` 文件，同时调用 `sched_setaffinity()` 设置 CPU 亲和性
 4. inotify 事件驱动配置文件热加载，自动回退到轮询模式作为兼容方案

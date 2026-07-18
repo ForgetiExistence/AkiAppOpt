@@ -140,7 +140,7 @@ all_core="$(cat /sys/devices/system/cpu/present)"
 module_instructions() {
 	ui_print "********************************************"
 	ui_print "线程规则配置文件路径为："
-	ui_print "/data/adb/modules/AppOpt/applist.conf"
+	ui_print "/data/adb/modules/AkiAppOpt/applist.conf"
 	ui_print "------------------------------------------"
 	ui_print "修改与添加规则无需重启，即时生效"
 	ui_print "********************************************"
@@ -285,9 +285,11 @@ com.netease.dwrg=$(format_cpu_ranges "$e_core $p_core")
 
 echo "$common_rules" >> $MODPATH/applist.conf
 echo "$game_rules" >> $MODPATH/applist.conf
-if [ -f /data/adb/modules/AppOpt/applist.conf ]; then
-	mv $MODPATH/applist.conf $MODPATH/applist.conf.bak
-	cp -r /data/adb/modules/AppOpt/applist.conf $MODPATH
+
+# Keep the user's rules when updating the installed module.
+if [ -f /data/adb/modules/AkiAppOpt/applist.conf ]; then
+	mv "$MODPATH/applist.conf" "$MODPATH/applist.conf.bak"
+	cp /data/adb/modules/AkiAppOpt/applist.conf "$MODPATH/applist.conf"
 fi
 }
 check_magisk_version
