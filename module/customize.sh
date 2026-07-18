@@ -25,7 +25,7 @@ check_required_files() {
 extract_bin() {
 	ui_print "********************************************"
 	if [ "$ARCH" == "arm" ]; then
-		cp $MODPATH/bin/armeabi-v7a/AppOpt $MODPATH
+		cp $MODPATH/bin/armabi-v7a/AppOpt $MODPATH
 	elif [ "$ARCH" == "arm64" ]; then
 		cp $MODPATH/bin/arm64-v8a/AppOpt $MODPATH
 	elif [ "$ARCH" == "x86" ]; then

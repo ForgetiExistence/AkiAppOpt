@@ -13,7 +13,7 @@
 | **自定义规则** | 配置文件定义「包名 → CPU 核心」映射，支持线程级通配符匹配 |
 | **热加载** | 基于 inotify 实时监控配置文件变更，无需重启服务 |
 | **低开销** | PID 跟踪 + 二分查找 + 增量扫描，最小化 `/proc` 遍历成本 |
-| **多架构** | 支持 arm64-v8a / armeabi-v7a / x86_64 |
+| **多架构** | 支持 arm64-v8a / armabi-v7a / x86_64 |
 | **Magisk 模块** | 以 Magisk / KernelSU 模块形式分发，开机自启 |
 
 ---
@@ -31,9 +31,9 @@
 aarch64-linux-android21-clang -O2 -s -static \
   -o module/bin/arm64-v8a/AppOpt module/AppOpt.c
 
-# armeabi-v7a
+# armabi-v7a
 armv7a-linux-androideabi21-clang -O2 -s -static \
-  -o module/bin/armeabi-v7a/AppOpt module/AppOpt.c
+  -o module/bin/armabi-v7a/AppOpt module/AppOpt.c
 
 # x86_64
 x86_64-linux-android21-clang -O2 -s -static \
@@ -105,7 +105,7 @@ com.miHoYo.Yuanshen{RenderThread}=6-7
 /data/adb/modules/AppOpt/
 ├── bin/
 │   ├── arm64-v8a/AppOpt
-│   ├── armeabi-v7a/AppOpt
+│   ├── armabi-v7a/AppOpt
 │   └── x86_64/AppOpt
 ├── service.sh          ← 开机启动脚本
 ├── module.prop         ← 模块元信息
