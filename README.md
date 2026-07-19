@@ -72,14 +72,17 @@ AppOpt [选项]
 ```
 # 以 # 开头的行为注释
 # 格式:
-#   包名=CPU范围              → 进程级规则
-#   包名{线程名}=CPU范围       → 线程级规则
+#   包名=CPU范围                    → 进程级规则
+#   包名{线程名}=CPU范围             → 线程级规则
+#   包名{线程名}:延迟单位=CPU范围     → 延迟线程级规则
+#   包名{}:延迟单位=CPU范围           → 延迟进程级规则
 
 # 示例
 com.tencent.mm=4-6
 com.tencent.mm{NetworkThread}=7
 com.miHoYo.Yuanshen=4-7
 com.miHoYo.Yuanshen{RenderThread}=6-7
+com.eg.android.AlipayGphone{RenderThread}:1000=2-6
 ```
 
 **语法说明：**
@@ -88,7 +91,10 @@ com.miHoYo.Yuanshen{RenderThread}=6-7
 |----------|------|
 | `包名` | 从 `/proc/<pid>/cmdline` 提取的进程名 |
 | `{线程名}` | 可选，支持 `fnmatch` 通配符（`*` `?` `[...]`） |
+| `:延迟单位` | 可选，仅写在 `}` 后；每单位为 100 ms，例如 `:1000` 表示延迟 100000 ms |
 | `CPU范围` | 支持 `0-3`、`4,5,6`、`0-3,6-7` 等写法 |
+
+延迟从应用被 AppOpt 识别时开始计算，是在正常绑核时刻基础上追加的等待时间。不写延迟或使用 `:0` 时行为与原规则相同；配置热加载和进程缓存重扫不会重新计时。
 
 **匹配优先级：**
 

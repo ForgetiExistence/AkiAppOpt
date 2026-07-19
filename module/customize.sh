@@ -223,10 +223,10 @@ com.ss.android.ugc.aweme{main}=$(format_cpu_ranges "$hp_core")
 com.ss.android.ugc.aweme{RenderThread}=$(format_cpu_ranges "$hp_core")
 com.ss.android.ugc.aweme{droid.ugc.aweme}=$(format_cpu_ranges "$p_core $hp_core")
 
-# 将 '支付宝' 渲染线程、主线程与扫一扫线程绑定到中大核
-com.eg.android.AlipayGphone{RenderThread}=$(format_cpu_ranges "$hp_core")
-com.eg.android.AlipayGphone{id.AlipayGphone}=$(format_cpu_ranges "$p_core $hp_core")
-com.eg.android.AlipayGphone{ScanRecognize}=$(format_cpu_ranges "$hp_core")
+# 将 '支付宝' 渲染线程延迟100秒，主线程与扫一扫线程延迟10秒后绑定到中大核
+com.eg.android.AlipayGphone{RenderThread}:1000=$(format_cpu_ranges "$hp_core")
+com.eg.android.AlipayGphone{id.AlipayGphone}:100=$(format_cpu_ranges "$p_core $hp_core")
+com.eg.android.AlipayGphone{ScanRecognize}:100=$(format_cpu_ranges "$hp_core")
 
 # 将 '高德地图' 渲染线程与主线程绑定到中大核
 com.autonavi.minimap{RenderThread}=$(format_cpu_ranges "$hp_core")

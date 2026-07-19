@@ -8,24 +8,29 @@
 #include <sched.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/inotify.h>
 #include <sys/stat.h>
 #include <sys/sysinfo.h>
+#include <time.h>
 #include <unistd.h>
 
 #define VERSION            "aki-0.1.0"
 #define BASE_CPUSET        "/dev/cpuset/AkiAppOpt"
 #define MAX_PKG_LEN        128
 #define MAX_THREAD_LEN     32
+#define DELAY_UNIT_MS      100ULL
+#define DELAY_POLL_US      100000
 
 typedef struct {
     char pkg[MAX_PKG_LEN];
     char thread[MAX_THREAD_LEN];
     char cpuset_dir[256];
     cpu_set_t cpus;
+    uint64_t delay_ms;
 } AffinityRule;
 
 typedef struct {
@@ -33,6 +38,7 @@ typedef struct {
     char name[MAX_THREAD_LEN];
     char cpuset_dir[256];
     cpu_set_t cpus;
+    uint64_t bind_after_ms;
 } ThreadInfo;
 
 typedef struct {
@@ -40,6 +46,8 @@ typedef struct {
     char pkg[MAX_PKG_LEN];
     char base_cpuset[128];
     cpu_set_t base_cpus;
+    uint64_t detected_at_ms;
+    uint64_t base_delay_ms;
     ThreadInfo* threads;
     size_t num_threads;
     size_t threads_cap;
@@ -47,6 +55,12 @@ typedef struct {
     size_t num_thread_rules;
     size_t thread_rules_cap;
 } ProcessInfo;
+
+typedef struct {
+    pid_t pid;
+    char pkg[MAX_PKG_LEN];
+    uint64_t detected_at_ms;
+} DetectedProcess;
 
 typedef struct {
     cpu_set_t present_cpus;
@@ -93,6 +107,19 @@ static char* strtrim(char* s) {
     while (end > s && isspace(*end)) end--;
     *(end + 1) = 0;
     return s;
+}
+
+static uint64_t monotonic_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+        return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+    }
+    return (uint64_t)time(NULL) * 1000ULL;
+}
+
+static uint64_t delay_deadline(uint64_t detected_at_ms, uint64_t delay_ms) {
+    if (delay_ms > UINT64_MAX - detected_at_ms) return UINT64_MAX;
+    return detected_at_ms + delay_ms;
 }
 
 static bool read_file(int dir_fd, const char* filename, char* buf, size_t buf_size) {
@@ -292,12 +319,27 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
 
         char* br = strchr(p, '{');
         char* thread = "";
+        uint64_t delay_ms = 0;
         if (br) {
             *br++ = 0;
             char* eb = strchr(br, '}');
             if (!eb) continue;
             *eb = 0;
             thread = strtrim(br);
+
+            char* suffix = strtrim(eb + 1);
+            if (*suffix) {
+                if (*suffix != ':') continue;
+                char* delay = strtrim(suffix + 1);
+                if (!isdigit((unsigned char)*delay)) continue;
+
+                errno = 0;
+                char* delay_end;
+                unsigned long long units = strtoull(delay, &delay_end, 10);
+                delay_end = strtrim(delay_end);
+                if (errno == ERANGE || *delay_end || units > UINT64_MAX / DELAY_UNIT_MS) continue;
+                delay_ms = (uint64_t)units * DELAY_UNIT_MS;
+            }
         }
 
         char* pkg = strtrim(p);
@@ -343,6 +385,7 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
         build_str(rule.thread, sizeof(rule.thread), thread, NULL);
         build_str(rule.cpuset_dir, sizeof(rule.cpuset_dir), dir_name, NULL);
         rule.cpus = set;
+        rule.delay_ms = delay_ms;
         free(dir_name);
 
         AffinityRule* tmp_rules = realloc(new_rules, (rules_cnt + 1) * sizeof(AffinityRule));
@@ -417,8 +460,24 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
         }
     }
 
+    size_t detected_count = cache->num_procs;
+    DetectedProcess* detected = NULL;
+    if (detected_count > 0) {
+        detected = malloc(detected_count * sizeof(DetectedProcess));
+        if (detected) {
+            for (size_t i = 0; i < detected_count; i++) {
+                detected[i].pid = cache->procs[i].pid;
+                build_str(detected[i].pkg, sizeof(detected[i].pkg), cache->procs[i].pkg, NULL);
+                detected[i].detected_at_ms = cache->procs[i].detected_at_ms;
+            }
+        } else {
+            detected_count = 0;
+        }
+    }
+
     struct dirent* ent;
     time_t current_time = time(NULL);
+    uint64_t current_monotonic_ms = monotonic_ms();
     int current_proc_total = 0;
     while ((ent = readdir(proc_dir))) {
         char *end;
@@ -476,8 +535,16 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
 
         proc->pid = pid;
         build_str(proc->pkg, sizeof(proc->pkg), name, NULL);
+        proc->detected_at_ms = current_monotonic_ms;
+        for (size_t i = 0; i < detected_count; i++) {
+            if (detected[i].pid == pid && strcmp(detected[i].pkg, name) == 0) {
+                proc->detected_at_ms = detected[i].detected_at_ms;
+                break;
+            }
+        }
         CPU_ZERO(&proc->base_cpus);
         proc->base_cpuset[0] = '\0';
+        proc->base_delay_ms = 0;
         proc->num_threads = 0;
         proc->num_thread_rules = 0;
 
@@ -508,6 +575,7 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
             } else {
                 CPU_OR(&proc->base_cpus, &proc->base_cpus, &rule->cpus);
                 build_str(proc->base_cpuset, sizeof(proc->base_cpuset), rule->cpuset_dir, NULL);
+                proc->base_delay_ms = rule->delay_ms;
             }
         }
 
@@ -563,7 +631,7 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
             ti->tid = tid;
             build_str(ti->name, sizeof(ti->name), tname, NULL);
             CPU_ZERO(&ti->cpus);
-            const char* matched = NULL;
+            const AffinityRule* matched = NULL;
             int best_literal = -1;
 
             for (size_t i = 0; i < proc->num_thread_rules; i++) {
@@ -571,7 +639,7 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
                 if (strcmp(rule->thread, ti->name) == 0) {
                     CPU_ZERO(&ti->cpus);
                     CPU_OR(&ti->cpus, &ti->cpus, &rule->cpus);
-                    matched = rule->cpuset_dir;
+                    matched = rule;
                     break;
                 }
                 if (fnmatch(rule->thread, ti->name, FNM_NOESCAPE) == 0) {
@@ -582,16 +650,18 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
                         best_literal = lit;
                         CPU_ZERO(&ti->cpus);
                         CPU_OR(&ti->cpus, &ti->cpus, &rule->cpus);
-                        matched = rule->cpuset_dir;
+                        matched = rule;
                     }
                 }
             }
 
             if (matched) {
-                build_str(ti->cpuset_dir, sizeof(ti->cpuset_dir), matched, NULL);
+                build_str(ti->cpuset_dir, sizeof(ti->cpuset_dir), matched->cpuset_dir, NULL);
+                ti->bind_after_ms = delay_deadline(proc->detected_at_ms, matched->delay_ms);
             } else {
                 ti->cpus = proc->base_cpus;
                 build_str(ti->cpuset_dir, sizeof(ti->cpuset_dir), proc->base_cpuset, NULL);
+                ti->bind_after_ms = delay_deadline(proc->detected_at_ms, proc->base_delay_ms);
             }
 
             proc->num_threads++;
@@ -612,6 +682,7 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
         (*count)++;
     }
     closedir(proc_dir);
+    free(detected);
     if (current_proc_total > cache->last_proc_total) {
         cache->scan_all_proc = true;
     } else {
@@ -677,11 +748,18 @@ static void update_cache(ProcCache* cache, const AppConfig* cfg, int* affinity_c
     }
 }
 
-static void apply_affinity(ProcCache* cache, const CpuTopology* topo) {
+static uint64_t apply_affinity(ProcCache* cache, const CpuTopology* topo, uint64_t now_ms) {
+    uint64_t next_delayed_bind_ms = UINT64_MAX;
     for (size_t i = 0; i < cache->num_procs; i++) {
         const ProcessInfo* proc = &cache->procs[i];
         for (size_t j = 0; j < proc->num_threads; j++) {
             const ThreadInfo* ti = &proc->threads[j];
+            if (ti->bind_after_ms > now_ms) {
+                if (ti->bind_after_ms < next_delayed_bind_ms) {
+                    next_delayed_bind_ms = ti->bind_after_ms;
+                }
+                continue;
+            }
             if (topo->cpuset_enabled && topo->base_cpuset_fd != -1) {
                 char tid_str[32];
                 snprintf(tid_str, sizeof(tid_str), "%d\n", ti->tid);
@@ -709,6 +787,7 @@ static void apply_affinity(ProcCache* cache, const CpuTopology* topo) {
             }
         }
     }
+    return next_delayed_bind_ms;
 }
 
 static void config_release(AppConfig* cfg) {
@@ -928,24 +1007,38 @@ int main(int argc, char **argv) {
 
     ProcCache cache = {0};
     int affinity_counter = 0;
+    uint64_t next_scan_ms = 0;
+    uint64_t next_delayed_bind_ms = UINT64_MAX;
     printf("启动AppOpt服务 v%s\n", VERSION);
 
     for (;;) {
+        uint64_t now_ms = monotonic_ms();
         if (atomic_exchange(&config_updated, 0)) {
             cache.scan_all_proc = true;
             cache.last_proc_count = 0;
+            next_scan_ms = 0;
+            next_delayed_bind_ms = UINT64_MAX;
         }
 
-        AppConfig* cfg = get_config();
-        if (cfg) {
-            update_cache(&cache, cfg, &affinity_counter);
-            affinity_counter--;
-            if (affinity_counter < 1) {
-                apply_affinity(&cache, &cfg->topo);
-                affinity_counter = 5;
+        if (now_ms >= next_scan_ms) {
+            AppConfig* cfg = get_config();
+            if (cfg) {
+                update_cache(&cache, cfg, &affinity_counter);
+                affinity_counter--;
+                if (affinity_counter < 1) {
+                    now_ms = monotonic_ms();
+                    next_delayed_bind_ms = apply_affinity(&cache, &cfg->topo, now_ms);
+                    affinity_counter = 5;
+                }
+                config_release(cfg);
             }
-            config_release(cfg);
+            next_scan_ms = now_ms + (uint64_t)sleep_interval * 1000ULL;
         }
-        sleep(sleep_interval);
+
+        now_ms = monotonic_ms();
+        if (next_delayed_bind_ms != UINT64_MAX && now_ms >= next_delayed_bind_ms) {
+            next_delayed_bind_ms = apply_affinity(&cache, &topo, now_ms);
+        }
+        usleep(DELAY_POLL_US);
     }
 }
