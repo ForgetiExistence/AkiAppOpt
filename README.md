@@ -70,7 +70,7 @@ AppOpt [选项]
 ### 配置文件格式 (`applist.conf`)
 
 ```
-# 以 # 开头的行为注释
+# 以 # 或 // 开头的行为注释
 # 格式:
 #   包名=CPU范围                    → 进程级规则
 #   包名{线程名}=CPU范围             → 线程级规则
@@ -116,6 +116,7 @@ com.eg.android.AlipayGphone{RenderThread}:1000=2-6
 ├── service.sh          ← 开机启动脚本
 ├── module.prop         ← 模块元信息
 ├── customize.sh        ← 刷入时安装脚本
+├── rules.sh            ← 默认规则生成脚本
 └── applist.conf        ← 默认配置文件
 ```
 

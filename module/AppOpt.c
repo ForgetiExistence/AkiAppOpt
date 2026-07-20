@@ -149,6 +149,7 @@ static int build_str(char *dest, size_t dest_size, ...) {
     while ((segment = va_arg(args, const char *)) != NULL) {
         size_t len = strlen(segment);
         if (len > remaining) {
+            *p = '\0';
             va_end(args);
             return 0;
         }
@@ -161,25 +162,33 @@ static int build_str(char *dest, size_t dest_size, ...) {
     return 1;
 }
 
-static void parse_cpu_ranges(const char* spec, cpu_set_t* set, const cpu_set_t* present) {
-    if (!spec) return;
-    char* copy = strdup(spec);
-    if (!copy) return;
-    char* s = copy;
+static bool parse_cpu_ranges(const char* spec, cpu_set_t* set, const cpu_set_t* present) {
+    if (!spec) return false;
+    const char* s = spec;
+    bool parsed = false;
 
-    while (*s) {
+    while (true) {
+        while (isspace((unsigned char)*s)) s++;
+        if (!isdigit((unsigned char)*s)) return false;
+
+        errno = 0;
         char* end;
         unsigned long a = strtoul(s, &end, 10);
-        if (end == s) {
-            s++;
-            continue;
-        }
+        if (errno == ERANGE || end == s) return false;
+        s = end;
+        while (isspace((unsigned char)*s)) s++;
 
         unsigned long b = a;
-        if (*end == '-') {
-            s = end + 1;
+        if (*s == '-') {
+            s++;
+            while (isspace((unsigned char)*s)) s++;
+            if (!isdigit((unsigned char)*s)) return false;
+
+            errno = 0;
             b = strtoul(s, &end, 10);
-            if (end == s) b = a;
+            if (errno == ERANGE || end == s) return false;
+            s = end;
+            while (isspace((unsigned char)*s)) s++;
         }
 
         if (a > b) { unsigned long t = a; a = b; b = t; }
@@ -187,10 +196,14 @@ static void parse_cpu_ranges(const char* spec, cpu_set_t* set, const cpu_set_t* 
             if (present && !CPU_ISSET(i, present)) continue;
             CPU_SET(i, set);
         }
+        parsed = true;
 
-        s = (*end == ',') ? end + 1 : end;
+        if (!*s) break;
+        if (*s != ',') return false;
+        s++;
     }
-    free(copy);
+
+    return parsed;
 }
 
 static char* cpu_set_to_str(const cpu_set_t *set) {
@@ -284,6 +297,98 @@ static CpuTopology init_cpu_topo(void) {
     return topo;
 }
 
+typedef enum {
+    RULE_ADD_ADDED,
+    RULE_ADD_DUPLICATE,
+    RULE_ADD_INVALID,
+    RULE_ADD_SKIPPED,
+    RULE_ADD_NO_MEMORY
+} RuleAddResult;
+
+static RuleAddResult add_rule(AffinityRule** rules, size_t* rules_cnt,
+                              const CpuTopology* topo, const char* pkg,
+                              const char* thread, const char* cpus_spec,
+                              uint64_t delay_ms) {
+    if (strlen(pkg) >= MAX_PKG_LEN || strlen(thread) >= MAX_THREAD_LEN) {
+        return RULE_ADD_INVALID;
+    }
+
+    for (size_t i = 0; i < *rules_cnt; i++) {
+        if (strcmp((*rules)[i].pkg, pkg) == 0 &&
+            strcmp((*rules)[i].thread, thread) == 0) {
+            return RULE_ADD_DUPLICATE;
+        }
+    }
+
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (!parse_cpu_ranges(cpus_spec, &set, &topo->present_cpus) || CPU_COUNT(&set) == 0) {
+        return RULE_ADD_INVALID;
+    }
+
+    char* dir_name = cpu_set_to_str(&set);
+    if (!dir_name) return RULE_ADD_NO_MEMORY;
+
+    AffinityRule rule = {0};
+    char path[256];
+    if (!build_str(path, sizeof(path), BASE_CPUSET, "/", dir_name, NULL) ||
+        !build_str(rule.pkg, sizeof(rule.pkg), pkg, NULL) ||
+        !build_str(rule.thread, sizeof(rule.thread), thread, NULL) ||
+        !build_str(rule.cpuset_dir, sizeof(rule.cpuset_dir), dir_name, NULL)) {
+        free(dir_name);
+        return RULE_ADD_INVALID;
+    }
+
+    if (!create_cpuset_dir(path, dir_name, topo->mems_str)) {
+        free(dir_name);
+        return RULE_ADD_SKIPPED;
+    }
+
+    rule.cpus = set;
+    rule.delay_ms = delay_ms;
+    free(dir_name);
+
+    AffinityRule* tmp = realloc(*rules, (*rules_cnt + 1) * sizeof(AffinityRule));
+    if (!tmp) return RULE_ADD_NO_MEMORY;
+    *rules = tmp;
+    memcpy(&(*rules)[*rules_cnt], &rule, sizeof(AffinityRule));
+    (*rules_cnt)++;
+    return RULE_ADD_ADDED;
+}
+
+static bool build_pkg_list(const AffinityRule* rules, size_t rules_cnt,
+                           char*** out_pkgs, size_t* out_cnt) {
+    char** pkgs = NULL;
+    size_t cnt = 0;
+
+    for (size_t i = 0; i < rules_cnt; i++) {
+        bool exists = false;
+        for (size_t j = 0; j < cnt; j++) {
+            if (strcmp(pkgs[j], rules[i].pkg) == 0) {
+                exists = true;
+                break;
+            }
+        }
+        if (exists) continue;
+
+        char** tmp = realloc(pkgs, (cnt + 1) * sizeof(char*));
+        if (!tmp) goto error;
+        pkgs = tmp;
+        pkgs[cnt] = strdup(rules[i].pkg);
+        if (!pkgs[cnt]) goto error;
+        cnt++;
+    }
+
+    *out_pkgs = pkgs;
+    *out_cnt = cnt;
+    return true;
+
+error:
+    for (size_t i = 0; i < cnt; i++) free(pkgs[i]);
+    free(pkgs);
+    return false;
+}
+
 static AppConfig* load_config(const char* config_file, const CpuTopology* topo, time_t* last_mtime) {
     struct stat st;
     if (stat(config_file, &st)) return NULL;
@@ -306,15 +411,18 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
 
     AffinityRule* new_rules = NULL;
     char** new_pkgs = NULL;
-    size_t rules_cnt = 0, pkgs_cnt = 0;
+    size_t rules_cnt = 0, pkgs_cnt = 0, fail_cnt = 0;
     char line[256];
 
     while (fgets(line, sizeof(line), fp)) {
         char* p = strtrim(line);
-        if (*p == '#' || !*p) continue;
+        if (!*p || *p == '#' || (p[0] == '/' && p[1] == '/')) continue;
 
         char* eq = strchr(p, '=');
-        if (!eq) continue;
+        if (!eq) {
+            fail_cnt++;
+            continue;
+        }
         *eq++ = 0;
 
         char* br = strchr(p, '{');
@@ -323,21 +431,33 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
         if (br) {
             *br++ = 0;
             char* eb = strchr(br, '}');
-            if (!eb) continue;
+            if (!eb) {
+                fail_cnt++;
+                continue;
+            }
             *eb = 0;
             thread = strtrim(br);
 
             char* suffix = strtrim(eb + 1);
             if (*suffix) {
-                if (*suffix != ':') continue;
+                if (*suffix != ':') {
+                    fail_cnt++;
+                    continue;
+                }
                 char* delay = strtrim(suffix + 1);
-                if (!isdigit((unsigned char)*delay)) continue;
+                if (!isdigit((unsigned char)*delay)) {
+                    fail_cnt++;
+                    continue;
+                }
 
                 errno = 0;
                 char* delay_end;
                 unsigned long long units = strtoull(delay, &delay_end, 10);
                 delay_end = strtrim(delay_end);
-                if (errno == ERANGE || *delay_end || units > UINT64_MAX / DELAY_UNIT_MS) continue;
+                if (errno == ERANGE || *delay_end || units > UINT64_MAX / DELAY_UNIT_MS) {
+                    fail_cnt++;
+                    continue;
+                }
                 delay_ms = (uint64_t)units * DELAY_UNIT_MS;
             }
         }
@@ -351,67 +471,17 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
             cpus = strtrim(cpus);
         }
 
-        if (strlen(pkg) >= MAX_PKG_LEN || strlen(thread) >= MAX_THREAD_LEN) continue;
-
-        {
-            bool dup = false;
-            for (size_t i = 0; i < rules_cnt; i++) {
-                if (strcmp(new_rules[i].pkg, pkg) == 0 &&
-                    strcmp(new_rules[i].thread, thread) == 0) {
-                    dup = true;
-                    break;
-                }
-            }
-            if (dup) continue;
+        RuleAddResult result = add_rule(&new_rules, &rules_cnt, &cfg->topo,
+                                        pkg, thread, cpus, delay_ms);
+        if (result == RULE_ADD_INVALID) {
+            fail_cnt++;
+        } else if (result == RULE_ADD_NO_MEMORY) {
+            goto error;
         }
 
-        cpu_set_t set;
-        CPU_ZERO(&set);
-        parse_cpu_ranges(cpus, &set, &cfg->topo.present_cpus);
-        if (CPU_COUNT(&set) == 0) continue;
-
-        char* dir_name = cpu_set_to_str(&set);
-        if (!dir_name) continue;
-
-        char path[256];
-        build_str(path, sizeof(path), BASE_CPUSET, "/", dir_name, NULL);
-        if (!create_cpuset_dir(path, dir_name, cfg->topo.mems_str)) {
-            free(dir_name);
-            continue;
-        }
-
-        AffinityRule rule = {0};
-        build_str(rule.pkg, sizeof(rule.pkg), pkg, NULL);
-        build_str(rule.thread, sizeof(rule.thread), thread, NULL);
-        build_str(rule.cpuset_dir, sizeof(rule.cpuset_dir), dir_name, NULL);
-        rule.cpus = set;
-        rule.delay_ms = delay_ms;
-        free(dir_name);
-
-        AffinityRule* tmp_rules = realloc(new_rules, (rules_cnt + 1) * sizeof(AffinityRule));
-        if (!tmp_rules) goto error;
-        new_rules = tmp_rules;
-        memcpy(&new_rules[rules_cnt], &rule, sizeof(AffinityRule));
-        rules_cnt++;
-
-        bool exists = false;
-        if (new_pkgs != NULL) {
-            for (size_t i = 0; i < pkgs_cnt; i++) {
-                if (strcmp(new_pkgs[i], pkg) == 0) {
-                    exists = true;
-                    break;
-                }
-            }
-        }
-        if (!exists) {
-            char** tmp_pkgs = realloc(new_pkgs, (pkgs_cnt + 1) * sizeof(char*));
-            if (!tmp_pkgs) goto error;
-            new_pkgs = tmp_pkgs;
-            new_pkgs[pkgs_cnt] = strdup(pkg);
-            if (!new_pkgs[pkgs_cnt]) goto error;
-            pkgs_cnt++;
-        }
     }
+
+    if (!build_pkg_list(new_rules, rules_cnt, &new_pkgs, &pkgs_cnt)) goto error;
 
     if (cfg->rules) free(cfg->rules);
     if (cfg->pkgs) {
@@ -428,6 +498,9 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
 
     fclose(fp);
     printf("配置文件解析完成，共加载 %zu 条规则\n", rules_cnt);
+    if (fail_cnt > 0) {
+        fprintf(stderr, "警告: %zu 条规则因格式、CPU 范围或长度无效被跳过\n", fail_cnt);
+    }
     return cfg;
 
 error:
