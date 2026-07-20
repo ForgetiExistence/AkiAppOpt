@@ -97,7 +97,8 @@ static atomic_int config_updated = ATOMIC_VAR_INIT(0);
 static int inotify_fd = -1;
 static int inotify_wd = -1;
 static int inotify_supported = 0;
-static _Atomic(AppConfig*) current_config = NULL;
+static pthread_mutex_t config_mutex = PTHREAD_MUTEX_INITIALIZER;
+static AppConfig* current_config = NULL;
 
 static char* strtrim(char* s) {
     char* end;
@@ -764,17 +765,20 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
     cache->last_proc_total = current_proc_total;
 }
 
-static void update_cache(ProcCache* cache, const AppConfig* cfg, int* affinity_counter) {
-    bool need_reload = false;
+static void update_cache(ProcCache* cache, const AppConfig* cfg, int* affinity_counter,
+                         bool force_reload) {
+    bool need_reload = force_reload;
     struct sysinfo info;
     if (sysinfo(&info) != 0) {
         need_reload = true;
     } else {
         int current_proc_count = info.procs;
-        if (current_proc_count > cache->last_proc_count + 11) {
-            need_reload = true;
-        } else if (current_proc_count > cache->last_proc_count) {
-            *affinity_counter = 0;
+        if (!need_reload) {
+            if (current_proc_count > cache->last_proc_count + 11) {
+                need_reload = true;
+            } else if (current_proc_count > cache->last_proc_count) {
+                *affinity_counter = 0;
+            }
         }
         cache->last_proc_count = current_proc_count;
     }
@@ -821,6 +825,55 @@ static void update_cache(ProcCache* cache, const AppConfig* cfg, int* affinity_c
     }
 }
 
+static bool restore_thread_affinity(pid_t tid, const CpuTopology* topo) {
+    bool cpuset_restored = true;
+    if (topo->cpuset_enabled && topo->base_cpuset_fd != -1) {
+        char tid_str[32];
+        snprintf(tid_str, sizeof(tid_str), "%d\n", tid);
+        cpuset_restored = write_file(topo->base_cpuset_fd, "tasks", tid_str,
+                                     O_WRONLY | O_APPEND);
+    }
+
+    if (sched_setaffinity(tid, sizeof(topo->present_cpus), &topo->present_cpus) == 0) {
+        return cpuset_restored;
+    }
+    return errno == ESRCH;
+}
+
+static bool restore_cached_affinity(const ProcCache* cache, const CpuTopology* topo) {
+    bool restored = true;
+    for (size_t i = 0; i < cache->num_procs; i++) {
+        const ProcessInfo* proc = &cache->procs[i];
+        char task_path[64];
+        int path_len = snprintf(task_path, sizeof(task_path), "/proc/%d/task", proc->pid);
+        if (path_len < 0 || (size_t)path_len >= sizeof(task_path)) {
+            restored = false;
+            continue;
+        }
+
+        DIR* task_dir = opendir(task_path);
+        if (!task_dir) {
+            if (errno != ENOENT && errno != ESRCH) restored = false;
+            continue;
+        }
+
+        while (true) {
+            errno = 0;
+            struct dirent* entry = readdir(task_dir);
+            if (!entry) {
+                if (errno != 0) restored = false;
+                break;
+            }
+            char* end;
+            long tid = strtol(entry->d_name, &end, 10);
+            if (*end != '\0') continue;
+            if (!restore_thread_affinity((pid_t)tid, topo)) restored = false;
+        }
+        closedir(task_dir);
+    }
+    return restored;
+}
+
 static uint64_t apply_affinity(ProcCache* cache, const CpuTopology* topo, uint64_t now_ms) {
     uint64_t next_delayed_bind_ms = UINT64_MAX;
     for (size_t i = 0; i < cache->num_procs; i++) {
@@ -833,18 +886,25 @@ static uint64_t apply_affinity(ProcCache* cache, const CpuTopology* topo, uint64
                 }
                 continue;
             }
+            bool restore_default = CPU_COUNT(&ti->cpus) == 0;
+            const cpu_set_t* target_cpus = restore_default ? &topo->present_cpus : &ti->cpus;
+            cpu_set_t current_cpus;
+            bool affinity_matches = false;
+            if (sched_getaffinity(ti->tid, sizeof(current_cpus), &current_cpus) == 0) {
+                affinity_matches = CPU_EQUAL(target_cpus, &current_cpus);
+            } else if (errno == ESRCH) {
+                cache->last_proc_count = 0;
+                continue;
+            }
+
+            if (affinity_matches) continue;
+
             if (topo->cpuset_enabled && topo->base_cpuset_fd != -1) {
                 char tid_str[32];
                 snprintf(tid_str, sizeof(tid_str), "%d\n", ti->tid);
-                if (CPU_COUNT(&ti->cpus) == 0) {
-                    cpu_set_t curr;
-                    if (sched_getaffinity(ti->tid, sizeof(curr), &curr) == -1) continue;
-                    if (CPU_EQUAL(&topo->present_cpus, &curr)) continue;
+                if (restore_default) {
                     write_file(topo->base_cpuset_fd, "tasks", tid_str, O_WRONLY | O_APPEND);
                 } else {
-                    cpu_set_t curr;
-                    if (sched_getaffinity(ti->tid, sizeof(curr), &curr) == -1) continue;
-                    if (CPU_EQUAL(&ti->cpus, &curr)) continue;
                     if (ti->cpuset_dir[0]) {
                         int fd = openat(topo->base_cpuset_fd, ti->cpuset_dir, O_RDONLY | O_DIRECTORY);
                         if (fd != -1) {
@@ -854,8 +914,7 @@ static uint64_t apply_affinity(ProcCache* cache, const CpuTopology* topo, uint64
                     }
                 }
             }
-            if (CPU_COUNT(&ti->cpus) == 0) continue;
-            if (sched_setaffinity(ti->tid, sizeof(ti->cpus), &ti->cpus) == -1 && errno == ESRCH) {
+            if (sched_setaffinity(ti->tid, sizeof(*target_cpus), target_cpus) == -1 && errno == ESRCH) {
                 cache->last_proc_count = 0;
             }
         }
@@ -876,18 +935,19 @@ static void config_release(AppConfig* cfg) {
 }
 
 static AppConfig* get_config() {
-    AppConfig* cfg = atomic_load_explicit(&current_config, memory_order_acquire);
-    if (!cfg) return NULL;
-    int old_ref = atomic_fetch_add_explicit(&cfg->ref_count, 1, memory_order_acq_rel);
-    if (old_ref <= 0) {
-        atomic_fetch_sub_explicit(&cfg->ref_count, 1, memory_order_release);
-        return NULL;
-    }
-    if (atomic_load_explicit(&current_config, memory_order_acquire) != cfg) {
-        atomic_fetch_sub_explicit(&cfg->ref_count, 1, memory_order_release);
-        return NULL;
-    }
+    pthread_mutex_lock(&config_mutex);
+    AppConfig* cfg = current_config;
+    if (cfg) atomic_fetch_add_explicit(&cfg->ref_count, 1, memory_order_relaxed);
+    pthread_mutex_unlock(&config_mutex);
     return cfg;
+}
+
+static AppConfig* replace_config(AppConfig* new_config) {
+    pthread_mutex_lock(&config_mutex);
+    AppConfig* old_config = current_config;
+    current_config = new_config;
+    pthread_mutex_unlock(&config_mutex);
+    return old_config;
 }
 
 static void* config_loader_thread(void* arg) {
@@ -958,7 +1018,7 @@ static void* config_loader_thread(void* arg) {
                 if (cfg) {
                     AppConfig* new_config = load_config(cfg->config_file, &cfg->topo, &last_mtime);
                     if (new_config) {
-                        AppConfig* old_config = atomic_exchange(&current_config, new_config);
+                        AppConfig* old_config = replace_config(new_config);
                         atomic_store(&config_updated, 1);
                         if (old_config) config_release(old_config);
                     }
@@ -970,7 +1030,7 @@ static void* config_loader_thread(void* arg) {
             if (cfg) {
                 AppConfig* new_config = load_config(cfg->config_file, &cfg->topo, &last_mtime);
                 if (new_config) {
-                    AppConfig* old_config = atomic_exchange(&current_config, new_config);
+                    AppConfig* old_config = replace_config(new_config);
                     atomic_store(&config_updated, 1);
                     if (old_config) config_release(old_config);
                 }
@@ -1042,7 +1102,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "初始配置加载失败\n");
         exit(EXIT_FAILURE);
     }
-    atomic_store(&current_config, initial_config);
+    replace_config(initial_config);
     atomic_store(&config_updated, 1);
 
     inotify_fd = inotify_init1(IN_CLOEXEC);
@@ -1063,7 +1123,7 @@ int main(int argc, char **argv) {
     pthread_t loader_thread;
     int* interval_ptr = malloc(sizeof(int));
     if (!interval_ptr) {
-        config_release(initial_config);
+        config_release(replace_config(NULL));
         if (inotify_supported) close(inotify_fd);
         exit(EXIT_FAILURE);
     }
@@ -1072,7 +1132,7 @@ int main(int argc, char **argv) {
     if (pthread_create(&loader_thread, NULL, config_loader_thread, interval_ptr) != 0) {
         perror("配置加载器线程创建失败");
         free(interval_ptr);
-        config_release(initial_config);
+        config_release(replace_config(NULL));
         if (inotify_supported) close(inotify_fd);
         exit(EXIT_FAILURE);
     }
@@ -1082,11 +1142,30 @@ int main(int argc, char **argv) {
     int affinity_counter = 0;
     uint64_t next_scan_ms = 0;
     uint64_t next_delayed_bind_ms = UINT64_MAX;
+    bool affinity_restore_pending = false;
+    bool affinity_restore_warning_shown = false;
     printf("启动AppOpt服务 v%s\n", VERSION);
 
     for (;;) {
         uint64_t now_ms = monotonic_ms();
         if (atomic_exchange(&config_updated, 0)) {
+            affinity_restore_pending = true;
+            affinity_restore_warning_shown = false;
+        }
+
+        bool force_reload = false;
+        if (affinity_restore_pending) {
+            if (!restore_cached_affinity(&cache, &topo)) {
+                if (!affinity_restore_warning_shown) {
+                    fprintf(stderr, "警告: 旧线程亲和性恢复失败，将继续重试后再应用新配置\n");
+                    affinity_restore_warning_shown = true;
+                }
+                sleep(1);
+                continue;
+            }
+            affinity_restore_pending = false;
+            affinity_restore_warning_shown = false;
+            force_reload = true;
             cache.scan_all_proc = true;
             cache.last_proc_count = 0;
             next_scan_ms = 0;
@@ -1096,7 +1175,7 @@ int main(int argc, char **argv) {
         if (now_ms >= next_scan_ms) {
             AppConfig* cfg = get_config();
             if (cfg) {
-                update_cache(&cache, cfg, &affinity_counter);
+                update_cache(&cache, cfg, &affinity_counter, force_reload);
                 affinity_counter--;
                 if (affinity_counter < 1) {
                     now_ms = monotonic_ms();
