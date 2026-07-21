@@ -18,7 +18,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VERSION            "aki-0.1.0"
+#define VERSION            "aki-0.2.0"
 #define BASE_CPUSET        "/dev/cpuset/AkiAppOpt"
 #define MAX_PKG_LEN        128
 #define MAX_THREAD_LEN     32
