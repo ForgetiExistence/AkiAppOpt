@@ -125,7 +125,6 @@ com.example {
 ├── service.sh          ← 开机启动脚本
 ├── module.prop         ← 模块元信息
 ├── customize.sh        ← 刷入时安装脚本
-├── rules.sh            ← 默认规则生成脚本
 └── applist.conf        ← 默认配置文件
 ```
 
