@@ -14,7 +14,7 @@ check_magisk_version() {
 check_required_files() {
 	REQUIRED_FILE_LIST="/sys/devices/system/cpu/present /proc/loadavg"
 	for REQUIRED_FILE in $REQUIRED_FILE_LIST; do
-		if [ ! -e $REQUIRED_FILE ]; then
+		if [ ! -e "$REQUIRED_FILE" ]; then
 			ui_print "********************************************"
 			ui_print "! $REQUIRED_FILE 文件不存在"
 			ui_print "! 请联系模块作者"
@@ -25,32 +25,36 @@ check_required_files() {
 extract_bin() {
 	ui_print "********************************************"
 	if [ "$ARCH" == "arm" ]; then
-		cp $MODPATH/bin/armabi-v7a/AppOpt $MODPATH
+		cp "$MODPATH/bin/armabi-v7a/AppOpt" "$MODPATH/AppOpt"
 	elif [ "$ARCH" == "arm64" ]; then
-		cp $MODPATH/bin/arm64-v8a/AppOpt $MODPATH
+		cp "$MODPATH/bin/arm64-v8a/AppOpt" "$MODPATH/AppOpt"
 	elif [ "$ARCH" == "x86" ]; then
-		cp $MODPATH/bin/x86/AppOpt $MODPATH
+		cp "$MODPATH/bin/x86/AppOpt" "$MODPATH/AppOpt"
 	elif [ "$ARCH" == "x64" ]; then
-		cp $MODPATH/bin/x86_64/AppOpt -v $MODPATH
+		cp "$MODPATH/bin/x86_64/AppOpt" "$MODPATH/AppOpt"
 	else
 		abort "! Unsupported platform: $ARCH"
 	fi
 	ui_print "- Device platform: $ARCH"
-	rm -rf $MODPATH/bin
-	[ -f $MODPATH/AppOpt ] && chmod a+x $MODPATH/AppOpt
-	if ! $MODPATH/AppOpt -v; then
+	if [ ! -f "$MODPATH/AppOpt" ]; then
+		abort "! 当前架构缺少 AppOpt 二进制文件"
+	fi
+	rm -rf "$MODPATH/bin"
+	[ -f "$MODPATH/AppOpt" ] && chmod a+x "$MODPATH/AppOpt"
+	if ! "$MODPATH/AppOpt" -v; then
 		abort "! 主程序验证失败，请检查模块zip文件是否损坏"
 	fi
 }
 remove_sys_perf_config() {
-	for SYSPERFCONFIG in $(ls /system/vendor/bin/msm_irqbalance); do
-		[[ ! -d $MODPATH${SYSPERFCONFIG%/*} ]] && mkdir -p $MODPATH${SYSPERFCONFIG%/*}
+	for SYSPERFCONFIG in /system/vendor/bin/msm_irqbalance; do
+		[ -e "$SYSPERFCONFIG" ] || continue
+		[ -d "$MODPATH${SYSPERFCONFIG%/*}" ] || mkdir -p "$MODPATH${SYSPERFCONFIG%/*}"
 		ui_print "- Remove :$SYSPERFCONFIG"
-		touch $MODPATH$SYSPERFCONFIG
+		touch "$MODPATH$SYSPERFCONFIG"
 	done
 	if [ -n "$(pm path com.xiaomi.joyose)" ] && [ -n "$(getprop ro.miui.ui.version.code)" ]; then
 		pm disable --user 0 com.xiaomi.joyose/.smartop.SmartOpService
-		echo 'pm enable com.xiaomi.joyose/.smartop.SmartOpService' >> $MODPATH/uninstall.sh
+		echo 'pm enable com.xiaomi.joyose/.smartop.SmartOpService' >> "$MODPATH/uninstall.sh"
 	fi
 }
 format_cpu_ranges() {
@@ -149,10 +153,12 @@ module_instructions() {
 	done | paste -sd+)
 	ui_print "当前$(getprop ro.soc.model)设备为$(nproc)核CPU，规格是：$cores"
 	ui_print "可用CPU范围：$all_core"
+	ui_print "语义核心：e-core / p-core / hp-core / all-core"
+	ui_print "语义核心可与数字范围使用英文逗号组合"
 	ui_print "------------------------------------------"
-	[ -n "$(format_cpu_ranges "$e_core")" ] && echo "$(format_cpu_ranges "$e_core") 为能效小核，频率最高$((e_core_freq/1000)) MHz"
-	[ $total_groups -ge 3 ] && [ -n "$(format_cpu_ranges "$p_core")" ] && echo "$(format_cpu_ranges "$p_core") 为性能中核，频率最高$((p_core_freq/1000)) MHz"
-	[ $total_groups -ge 2 ] && [ -n "$(format_cpu_ranges "$hp_core")" ] && echo "$(format_cpu_ranges "$hp_core") 为高性能大核，频率最高$((hp_core_freq/1000)) MHz"
+	[ -n "${e_core// /}" ] && echo "$(format_cpu_ranges "$e_core") 为能效小核，频率最高$((e_core_freq/1000)) MHz"
+	[ $total_groups -ge 3 ] && [ -n "${p_core// /}" ] && echo "$(format_cpu_ranges "$p_core") 为性能中核，频率最高$((p_core_freq/1000)) MHz"
+	[ $total_groups -ge 2 ] && [ -n "${hp_core// /}" ] && echo "$(format_cpu_ranges "$hp_core") 为高性能大核，频率最高$((hp_core_freq/1000)) MHz"
 	ui_print "------------------------------------------"
 	ui_print "applist.conf 规则写法示例："
 	ui_print "------------------------------------------"
@@ -161,22 +167,22 @@ module_instructions() {
 		ui_print "surfaceflinger=$all_core"
 		ui_print "------------------------------------------"
 	fi
-	if [ -n "$(format_cpu_ranges "$hp_core")" ]; then
+	if [ -n "${hp_core// /}" ]; then
 		ui_print "单独将'图形显示组件'渲染引擎线程绑定到大核："
 		ui_print "surfaceflinger{RenderEngine}=$(format_cpu_ranges "$hp_core")"
 		ui_print "------------------------------------------"
 	fi
-	if [ -n "$(format_cpu_ranges "$e_core")" ]; then
+	if [ -n "${e_core// /}" ]; then
 		ui_print "将 '微信' 主进程绑定能效小核："
 		ui_print "com.tencent.mm=$(format_cpu_ranges "$e_core")"
 		ui_print "------------------------------------------"
 	fi
-	if [ -n "$(format_cpu_ranges "$e_core")" ]; then
+	if [ -n "${e_core// /}" ]; then
 		ui_print "将 '微信' 消息推送子进程绑定能效小核："
 		ui_print "com.tencent.mm:push=$(format_cpu_ranges "$e_core")"
 		ui_print "------------------------------------------"
 	fi
-	if [ -n "$(format_cpu_ranges "$hp_core")" ]; then
+	if [ -n "${hp_core// /}" ]; then
 		ui_print "将 '系统界面' 渲染线程绑定到性能大核："
 		ui_print "com.android.systemui{RenderThread}=$(format_cpu_ranges "$hp_core")"
 		ui_print "------------------------------------------"
@@ -191,11 +197,13 @@ add_default_rules() {
 	fi
 	. "$MODPATH/rules.sh"
 
-# Keep the user's rules when updating the installed module.
-if [ -f /data/adb/modules/AkiAppOpt/applist.conf ]; then
-	mv "$MODPATH/applist.conf" "$MODPATH/applist.conf.bak"
-	cp /data/adb/modules/AkiAppOpt/applist.conf "$MODPATH/applist.conf"
-fi
+	# 更新模块时保留用户规则。
+	OLD_CONFIG=/data/adb/modules/AkiAppOpt/applist.conf
+	if [ -f "$OLD_CONFIG" ]; then
+		mv "$MODPATH/applist.conf" "$MODPATH/applist.conf.bak"
+		cp "$OLD_CONFIG" "$MODPATH/applist.conf"
+		ui_print "- 已保留现有 applist.conf"
+	fi
 }
 check_magisk_version
 check_required_files

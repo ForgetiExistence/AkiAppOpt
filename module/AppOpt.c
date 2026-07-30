@@ -6,6 +6,7 @@
 #include <fnmatch.h>
 #include <pthread.h>
 #include <sched.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -13,13 +14,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/inotify.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/sysinfo.h>
 #include <time.h>
 #include <unistd.h>
 
 #define VERSION            "aki-0.2.0"
-#define BASE_CPUSET        "/dev/cpuset/AkiAppOpt"
+#define CPUSET_ROOT        "/dev/cpuset"
+#define DEFAULT_CPUSET     "AppOpt"
+#define BASE_CPUSET_MAX    256
 #define MAX_PKG_LEN        128
 #define MAX_THREAD_LEN     32
 #define DELAY_UNIT_MS      100ULL
@@ -64,6 +68,9 @@ typedef struct {
 
 typedef struct {
     cpu_set_t present_cpus;
+    cpu_set_t e_core;
+    cpu_set_t p_core;
+    cpu_set_t hp_core;
     char present_str[128];
     char mems_str[32];
     bool cpuset_enabled;
@@ -74,7 +81,7 @@ typedef struct {
     atomic_int ref_count;
     AffinityRule* rules;
     size_t num_rules;
-    time_t mtime;
+    struct timespec mtime;
     CpuTopology topo;
     char** pkgs;
     size_t num_pkgs;
@@ -99,13 +106,14 @@ static int inotify_wd = -1;
 static int inotify_supported = 0;
 static pthread_mutex_t config_mutex = PTHREAD_MUTEX_INITIALIZER;
 static AppConfig* current_config = NULL;
+static char base_cpuset[BASE_CPUSET_MAX] = CPUSET_ROOT "/" DEFAULT_CPUSET;
 
 static char* strtrim(char* s) {
     char* end;
-    while (isspace(*s)) s++;
+    while (isspace((unsigned char)*s)) s++;
     if (*s == 0) return s;
     end = s + strlen(s) - 1;
-    while (end > s && isspace(*end)) end--;
+    while (end > s && isspace((unsigned char)*end)) end--;
     *(end + 1) = 0;
     return s;
 }
@@ -163,6 +171,15 @@ static int build_str(char *dest, size_t dest_size, ...) {
     return 1;
 }
 
+static bool set_base_cpuset(const char* name) {
+    if (!name || !*name || strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return false;
+    for (const unsigned char* p = (const unsigned char*)name; *p; p++) {
+        if (!isalnum(*p) && *p != '_' && *p != '-' && *p != '.') return false;
+    }
+    int len = snprintf(base_cpuset, sizeof(base_cpuset), "%s/%s", CPUSET_ROOT, name);
+    return len > 0 && (size_t)len < sizeof(base_cpuset);
+}
+
 static bool parse_cpu_ranges(const char* spec, cpu_set_t* set, const cpu_set_t* present) {
     if (!spec) return false;
     const char* s = spec;
@@ -204,6 +221,82 @@ static bool parse_cpu_ranges(const char* spec, cpu_set_t* set, const cpu_set_t* 
         s++;
     }
 
+    return parsed;
+}
+
+static bool parse_cpu_list(const char* spec, cpu_set_t* set, const cpu_set_t* present) {
+    const char* s = spec;
+    bool parsed = false;
+
+    while (s && *s) {
+        while (isspace((unsigned char)*s) || *s == ',') s++;
+        if (!*s) break;
+        if (!isdigit((unsigned char)*s)) return false;
+
+        errno = 0;
+        char* end = NULL;
+        unsigned long first = strtoul(s, &end, 10);
+        if (errno == ERANGE || end == s) return false;
+        unsigned long last = first;
+        s = end;
+
+        if (*s == '-') {
+            s++;
+            if (!isdigit((unsigned char)*s)) return false;
+            errno = 0;
+            last = strtoul(s, &end, 10);
+            if (errno == ERANGE || end == s) return false;
+            s = end;
+        }
+        if (*s && !isspace((unsigned char)*s) && *s != ',') return false;
+        if (first > last) {
+            unsigned long tmp = first;
+            first = last;
+            last = tmp;
+        }
+        for (unsigned long cpu = first; cpu <= last && cpu < CPU_SETSIZE; cpu++) {
+            if (!present || CPU_ISSET(cpu, present)) CPU_SET(cpu, set);
+        }
+        parsed = true;
+    }
+    return parsed;
+}
+
+static bool parse_cpu_spec(const char* spec, cpu_set_t* set, const CpuTopology* topo) {
+    if (!spec || !*spec) return false;
+    char* copy = strdup(spec);
+    if (!copy) return false;
+
+    bool parsed = false;
+    char* cursor = copy;
+    char* part;
+    while ((part = strsep(&cursor, ",")) != NULL) {
+        part = strtrim(part);
+        if (!*part) {
+            free(copy);
+            return false;
+        }
+
+        const cpu_set_t* semantic = NULL;
+        if (strcmp(part, "e-core") == 0) semantic = &topo->e_core;
+        else if (strcmp(part, "p-core") == 0) semantic = &topo->p_core;
+        else if (strcmp(part, "hp-core") == 0) semantic = &topo->hp_core;
+        else if (strcmp(part, "all-core") == 0) semantic = &topo->present_cpus;
+
+        if (semantic) {
+            CPU_OR(set, set, semantic);
+        } else {
+            cpu_set_t numeric;
+            CPU_ZERO(&numeric);
+            if (!parse_cpu_ranges(part, &numeric, &topo->present_cpus)) {
+                free(copy);
+                return false;
+            }
+            CPU_OR(set, set, &numeric);
+        }
+        parsed = true;
+    }
+    free(copy);
     return parsed;
 }
 
@@ -271,24 +364,115 @@ static bool create_cpuset_dir(const char *path, const char *cpus, const char *me
     return write_file(AT_FDCWD, mems_path, mems, O_WRONLY | O_CREAT | O_TRUNC);
 }
 
+static bool ensure_cpuset_dir(const cpu_set_t* cpus, const CpuTopology* topo,
+                              char* dir_name, size_t dir_name_size) {
+    if (!topo->cpuset_enabled) {
+        dir_name[0] = '\0';
+        return true;
+    }
+
+    char* name = cpu_set_to_str(cpus);
+    if (!name) return false;
+    char path[BASE_CPUSET_MAX + 32];
+    bool ok = build_str(path, sizeof(path), base_cpuset, "/", name, NULL) &&
+              build_str(dir_name, dir_name_size, name, NULL) &&
+              create_cpuset_dir(path, name, topo->mems_str);
+    if (!ok) dir_name[0] = '\0';
+    free(name);
+    return ok;
+}
+
+typedef struct {
+    unsigned long long max_freq;
+    cpu_set_t cpus;
+} CpuFreqGroup;
+
+static int cpu_freq_group_cmp(const void* lhs, const void* rhs) {
+    const CpuFreqGroup* a = lhs;
+    const CpuFreqGroup* b = rhs;
+    return (a->max_freq > b->max_freq) - (a->max_freq < b->max_freq);
+}
+
+static void detect_core_types(CpuTopology* topo) {
+    DIR* dir = opendir("/sys/devices/system/cpu/cpufreq");
+    if (!dir) return;
+
+    CpuFreqGroup* groups = NULL;
+    size_t groups_cnt = 0;
+    int root_fd = dirfd(dir);
+    struct dirent* entry;
+    while ((entry = readdir(dir))) {
+        if (strncmp(entry->d_name, "policy", 6) != 0) continue;
+        int policy_fd = openat(root_fd, entry->d_name, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (policy_fd == -1) continue;
+
+        char freq_buf[32] = {0};
+        char cpus_buf[256] = {0};
+        bool ok = read_file(policy_fd, "cpuinfo_max_freq", freq_buf, sizeof(freq_buf)) &&
+                  read_file(policy_fd, "related_cpus", cpus_buf, sizeof(cpus_buf));
+        close(policy_fd);
+        if (!ok) continue;
+
+        char* freq_end = NULL;
+        errno = 0;
+        unsigned long long freq = strtoull(strtrim(freq_buf), &freq_end, 10);
+        if (errno == ERANGE || freq == 0 || !freq_end || *strtrim(freq_end)) continue;
+
+        cpu_set_t policy_cpus;
+        CPU_ZERO(&policy_cpus);
+        if (!parse_cpu_list(cpus_buf, &policy_cpus, &topo->present_cpus) ||
+            CPU_COUNT(&policy_cpus) == 0) continue;
+
+        size_t group_idx = groups_cnt;
+        for (size_t i = 0; i < groups_cnt; i++) {
+            if (groups[i].max_freq == freq) {
+                group_idx = i;
+                break;
+            }
+        }
+        if (group_idx == groups_cnt) {
+            CpuFreqGroup* resized = realloc(groups, (groups_cnt + 1) * sizeof(*groups));
+            if (!resized) break;
+            groups = resized;
+            groups[group_idx].max_freq = freq;
+            CPU_ZERO(&groups[group_idx].cpus);
+            groups_cnt++;
+        }
+        CPU_OR(&groups[group_idx].cpus, &groups[group_idx].cpus, &policy_cpus);
+    }
+    closedir(dir);
+
+    if (groups_cnt > 1) qsort(groups, groups_cnt, sizeof(*groups), cpu_freq_group_cmp);
+    for (size_t i = 0; i < groups_cnt; i++) {
+        cpu_set_t* target = i == 0 ? &topo->e_core :
+                            i == groups_cnt - 1 ? &topo->hp_core : &topo->p_core;
+        CPU_OR(target, target, &groups[i].cpus);
+    }
+    free(groups);
+}
+
 static CpuTopology init_cpu_topo(void) {
     CpuTopology topo = { .cpuset_enabled = false, .base_cpuset_fd = -1 };
     CPU_ZERO(&topo.present_cpus);
+    CPU_ZERO(&topo.e_core);
+    CPU_ZERO(&topo.p_core);
+    CPU_ZERO(&topo.hp_core);
 
     if (read_file(AT_FDCWD, "/sys/devices/system/cpu/present", topo.present_str, sizeof(topo.present_str))) {
         strtrim(topo.present_str);
     }
     parse_cpu_ranges(topo.present_str, &topo.present_cpus, NULL);
+    detect_core_types(&topo);
 
     if (access("/dev/cpuset", F_OK) != 0) return topo;
 
-    if (create_cpuset_dir(BASE_CPUSET, topo.present_str, "0")) {
-        topo.base_cpuset_fd = open(BASE_CPUSET, O_RDONLY | O_DIRECTORY);
+    if (create_cpuset_dir(base_cpuset, topo.present_str, "0")) {
+        topo.base_cpuset_fd = open(base_cpuset, O_RDONLY | O_DIRECTORY);
         if (topo.base_cpuset_fd != -1) topo.cpuset_enabled = true;
     }
 
     char mems_path[256];
-    build_str(mems_path, sizeof(mems_path), BASE_CPUSET, "/mems", NULL);
+    build_str(mems_path, sizeof(mems_path), base_cpuset, "/mems", NULL);
     if (!read_file(AT_FDCWD, mems_path, topo.mems_str, sizeof(topo.mems_str))) {
         build_str(topo.mems_str, sizeof(topo.mems_str), "0", NULL);
     } else {
@@ -300,9 +484,7 @@ static CpuTopology init_cpu_topo(void) {
 
 typedef enum {
     RULE_ADD_ADDED,
-    RULE_ADD_DUPLICATE,
     RULE_ADD_INVALID,
-    RULE_ADD_SKIPPED,
     RULE_ADD_NO_MEMORY
 } RuleAddResult;
 
@@ -310,44 +492,27 @@ static RuleAddResult add_rule(AffinityRule** rules, size_t* rules_cnt,
                               const CpuTopology* topo, const char* pkg,
                               const char* thread, const char* cpus_spec,
                               uint64_t delay_ms) {
-    if (strlen(pkg) >= MAX_PKG_LEN || strlen(thread) >= MAX_THREAD_LEN) {
+    if (!*pkg || strlen(pkg) >= MAX_PKG_LEN || strlen(thread) >= MAX_THREAD_LEN) {
         return RULE_ADD_INVALID;
-    }
-
-    for (size_t i = 0; i < *rules_cnt; i++) {
-        if (strcmp((*rules)[i].pkg, pkg) == 0 &&
-            strcmp((*rules)[i].thread, thread) == 0) {
-            return RULE_ADD_DUPLICATE;
-        }
     }
 
     cpu_set_t set;
     CPU_ZERO(&set);
-    if (!parse_cpu_ranges(cpus_spec, &set, &topo->present_cpus) || CPU_COUNT(&set) == 0) {
+    if (!parse_cpu_spec(cpus_spec, &set, topo) || CPU_COUNT(&set) == 0) {
         return RULE_ADD_INVALID;
     }
-
-    char* dir_name = cpu_set_to_str(&set);
-    if (!dir_name) return RULE_ADD_NO_MEMORY;
 
     AffinityRule rule = {0};
-    char path[256];
-    if (!build_str(path, sizeof(path), BASE_CPUSET, "/", dir_name, NULL) ||
-        !build_str(rule.pkg, sizeof(rule.pkg), pkg, NULL) ||
-        !build_str(rule.thread, sizeof(rule.thread), thread, NULL) ||
-        !build_str(rule.cpuset_dir, sizeof(rule.cpuset_dir), dir_name, NULL)) {
-        free(dir_name);
+    if (!build_str(rule.pkg, sizeof(rule.pkg), pkg, NULL) ||
+        !build_str(rule.thread, sizeof(rule.thread), thread, NULL)) {
         return RULE_ADD_INVALID;
     }
 
-    if (!create_cpuset_dir(path, dir_name, topo->mems_str)) {
-        free(dir_name);
-        return RULE_ADD_SKIPPED;
-    }
+    if (!*thread)
+        ensure_cpuset_dir(&set, topo, rule.cpuset_dir, sizeof(rule.cpuset_dir));
 
     rule.cpus = set;
     rule.delay_ms = delay_ms;
-    free(dir_name);
 
     AffinityRule* tmp = realloc(*rules, (*rules_cnt + 1) * sizeof(AffinityRule));
     if (!tmp) return RULE_ADD_NO_MEMORY;
@@ -390,7 +555,52 @@ error:
     return false;
 }
 
-static AppConfig* load_config(const char* config_file, const CpuTopology* topo, time_t* last_mtime) {
+static bool comment_or_empty(char* text) {
+    text = strtrim(text);
+    return !*text || *text == '#' || (text[0] == '/' && text[1] == '/');
+}
+
+static void strip_cpu_comment(char* cpus) {
+    char* comment = strchr(cpus, '#');
+    char* slash_comment = strstr(cpus, "//");
+    if (!comment || (slash_comment && slash_comment < comment)) comment = slash_comment;
+    if (comment) *comment = '\0';
+}
+
+static bool parse_delay_suffix(char* suffix, uint64_t* delay_ms) {
+    suffix = strtrim(suffix);
+    *delay_ms = 0;
+    if (!*suffix) return true;
+    if (*suffix != ':') return false;
+    char* delay = strtrim(suffix + 1);
+    if (!isdigit((unsigned char)*delay)) return false;
+    errno = 0;
+    char* end = NULL;
+    unsigned long long units = strtoull(delay, &end, 10);
+    end = strtrim(end);
+    if (errno == ERANGE || *end || units > UINT64_MAX / DELAY_UNIT_MS) return false;
+    *delay_ms = (uint64_t)units * DELAY_UNIT_MS;
+    return true;
+}
+
+static bool append_rule(AffinityRule** rules, size_t* rules_cnt, const CpuTopology* topo,
+                        char* pkg, char* thread, char* cpus, char* delay_suffix,
+                        size_t* fail_cnt) {
+    strip_cpu_comment(cpus);
+    uint64_t delay_ms = 0;
+    if (!parse_delay_suffix(delay_suffix, &delay_ms)) {
+        (*fail_cnt)++;
+        return true;
+    }
+    RuleAddResult result = add_rule(rules, rules_cnt, topo, strtrim(pkg), strtrim(thread),
+                                    strtrim(cpus), delay_ms);
+    if (result == RULE_ADD_NO_MEMORY) return false;
+    if (result == RULE_ADD_INVALID) (*fail_cnt)++;
+    return true;
+}
+
+static AppConfig* load_config(const char* config_file, const CpuTopology* topo,
+                              struct timespec* last_mtime) {
     struct stat st;
     if (stat(config_file, &st)) return NULL;
     AppConfig* cfg = calloc(1, sizeof(AppConfig));
@@ -399,7 +609,8 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
     cfg->topo = *topo;
     build_str(cfg->config_file, sizeof(cfg->config_file), config_file, NULL);
 
-    if (last_mtime && *last_mtime == st.st_mtime && *last_mtime != -1) {
+    if (last_mtime && last_mtime->tv_sec == st.st_mtim.tv_sec &&
+        last_mtime->tv_nsec == st.st_mtim.tv_nsec) {
         free(cfg);
         return NULL;
     }
@@ -414,73 +625,108 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
     char** new_pkgs = NULL;
     size_t rules_cnt = 0, pkgs_cnt = 0, fail_cnt = 0;
     char line[256];
+    char block_pkg[MAX_PKG_LEN] = {0};
+    bool in_block = false;
 
     while (fgets(line, sizeof(line), fp)) {
         char* p = strtrim(line);
         if (!*p || *p == '#' || (p[0] == '/' && p[1] == '/')) continue;
+
+        if (in_block) {
+            char* close = strchr(p, '}');
+            if (close) {
+                *close = '\0';
+                if (!comment_or_empty(close + 1)) fail_cnt++;
+            }
+
+            char* content = strtrim(p);
+            if (*content) {
+                char* eq = strchr(content, '=');
+                if (!eq) {
+                    fail_cnt++;
+                } else {
+                    *eq++ = '\0';
+                    char* thread = strtrim(content);
+                    char* delay_suffix = thread + strlen(thread);
+                    char delay_text[32] = {0};
+                    char* colon = strrchr(thread, ':');
+                    if (colon && isdigit((unsigned char)colon[1])) {
+                        if (!build_str(delay_text, sizeof(delay_text), ":", colon + 1, NULL))
+                            goto error;
+                        *colon = '\0';
+                        delay_suffix = delay_text;
+                    }
+                    if (!append_rule(&new_rules, &rules_cnt, &cfg->topo, block_pkg,
+                                     thread, eq, delay_suffix, &fail_cnt)) goto error;
+                }
+            }
+            if (close) {
+                in_block = false;
+                block_pkg[0] = '\0';
+            }
+            continue;
+        }
+
+        char* br = strchr(p, '{');
+        char* eb = br ? strchr(br + 1, '}') : NULL;
+        if (br && !eb) {
+            *br = '\0';
+            if (!comment_or_empty(br + 1)) {
+                fail_cnt++;
+                continue;
+            }
+
+            char* prefix = strtrim(p);
+            char* eq = strchr(prefix, '=');
+            if (eq) {
+                *eq++ = '\0';
+                if (!build_str(block_pkg, sizeof(block_pkg), strtrim(prefix), NULL)) {
+                    fail_cnt++;
+                    continue;
+                }
+                if (!append_rule(&new_rules, &rules_cnt, &cfg->topo, block_pkg,
+                                 "", eq, "", &fail_cnt)) goto error;
+            } else if (!build_str(block_pkg, sizeof(block_pkg), prefix, NULL)) {
+                fail_cnt++;
+                continue;
+            }
+            if (!*block_pkg) {
+                fail_cnt++;
+                continue;
+            }
+            in_block = true;
+            continue;
+        }
 
         char* eq = strchr(p, '=');
         if (!eq) {
             fail_cnt++;
             continue;
         }
-        *eq++ = 0;
-
-        char* br = strchr(p, '{');
+        *eq++ = '\0';
+        char* pkg = strtrim(p);
         char* thread = "";
-        uint64_t delay_ms = 0;
-        if (br) {
-            *br++ = 0;
-            char* eb = strchr(br, '}');
-            if (!eb) {
+        char* delay_suffix = "";
+
+        if (br && eb) {
+            *br++ = '\0';
+            *eb = '\0';
+            pkg = strtrim(p);
+            thread = strtrim(br);
+            delay_suffix = strtrim(eb + 1);
+            if (*delay_suffix && *delay_suffix != ':') {
                 fail_cnt++;
                 continue;
             }
-            *eb = 0;
-            thread = strtrim(br);
-
-            char* suffix = strtrim(eb + 1);
-            if (*suffix) {
-                if (*suffix != ':') {
-                    fail_cnt++;
-                    continue;
-                }
-                char* delay = strtrim(suffix + 1);
-                if (!isdigit((unsigned char)*delay)) {
-                    fail_cnt++;
-                    continue;
-                }
-
-                errno = 0;
-                char* delay_end;
-                unsigned long long units = strtoull(delay, &delay_end, 10);
-                delay_end = strtrim(delay_end);
-                if (errno == ERANGE || *delay_end || units > UINT64_MAX / DELAY_UNIT_MS) {
-                    fail_cnt++;
-                    continue;
-                }
-                delay_ms = (uint64_t)units * DELAY_UNIT_MS;
-            }
-        }
-
-        char* pkg = strtrim(p);
-        char* cpus = strtrim(eq);
-
-        char* hash = strchr(cpus, '#');
-        if (hash) {
-            *hash = '\0';
-            cpus = strtrim(cpus);
-        }
-
-        RuleAddResult result = add_rule(&new_rules, &rules_cnt, &cfg->topo,
-                                        pkg, thread, cpus, delay_ms);
-        if (result == RULE_ADD_INVALID) {
+        } else if (br || eb) {
             fail_cnt++;
-        } else if (result == RULE_ADD_NO_MEMORY) {
-            goto error;
+            continue;
         }
 
+        if (!append_rule(&new_rules, &rules_cnt, &cfg->topo, pkg, thread, eq,
+                         delay_suffix, &fail_cnt)) goto error;
     }
+    if (in_block) fail_cnt++;
 
     if (!build_pkg_list(new_rules, rules_cnt, &new_pkgs, &pkgs_cnt)) goto error;
 
@@ -490,12 +736,12 @@ static AppConfig* load_config(const char* config_file, const CpuTopology* topo, 
         free(cfg->pkgs);
     }
 
-    if (last_mtime) *last_mtime = st.st_mtime;
+    if (last_mtime) *last_mtime = st.st_mtim;
     cfg->rules = new_rules;
     cfg->num_rules = rules_cnt;
     cfg->pkgs = new_pkgs;
     cfg->num_pkgs = pkgs_cnt;
-    cfg->mtime = st.st_mtime;
+    cfg->mtime = st.st_mtim;
 
     fclose(fp);
     printf("配置文件解析完成，共加载 %zu 条规则\n", rules_cnt);
@@ -648,9 +894,13 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
                 proc->thread_rules[proc->num_thread_rules++] = (AffinityRule*)rule;
             } else {
                 CPU_OR(&proc->base_cpus, &proc->base_cpus, &rule->cpus);
-                build_str(proc->base_cpuset, sizeof(proc->base_cpuset), rule->cpuset_dir, NULL);
-                proc->base_delay_ms = rule->delay_ms;
+                if (rule->delay_ms > proc->base_delay_ms) proc->base_delay_ms = rule->delay_ms;
             }
+        }
+
+        if (CPU_COUNT(&proc->base_cpus) > 0) {
+            ensure_cpuset_dir(&proc->base_cpus, &cfg->topo, proc->base_cpuset,
+                              sizeof(proc->base_cpuset));
         }
 
         if (CPU_COUNT(&proc->base_cpus) == 0 && proc->num_thread_rules == 0) {
@@ -705,33 +955,22 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
             ti->tid = tid;
             build_str(ti->name, sizeof(ti->name), tname, NULL);
             CPU_ZERO(&ti->cpus);
-            const AffinityRule* matched = NULL;
-            int best_literal = -1;
+            bool matched = false;
+            uint64_t matched_delay_ms = 0;
 
             for (size_t i = 0; i < proc->num_thread_rules; i++) {
                 const AffinityRule* rule = proc->thread_rules[i];
-                if (strcmp(rule->thread, ti->name) == 0) {
-                    CPU_ZERO(&ti->cpus);
-                    CPU_OR(&ti->cpus, &ti->cpus, &rule->cpus);
-                    matched = rule;
-                    break;
-                }
                 if (fnmatch(rule->thread, ti->name, FNM_NOESCAPE) == 0) {
-                    int lit = 0;
-                    for (const char *c = rule->thread; *c; c++)
-                        if (*c != '*' && *c != '?' && *c != '[') lit++;
-                    if (lit > best_literal) {
-                        best_literal = lit;
-                        CPU_ZERO(&ti->cpus);
-                        CPU_OR(&ti->cpus, &ti->cpus, &rule->cpus);
-                        matched = rule;
-                    }
+                    CPU_OR(&ti->cpus, &ti->cpus, &rule->cpus);
+                    if (rule->delay_ms > matched_delay_ms) matched_delay_ms = rule->delay_ms;
+                    matched = true;
                 }
             }
 
             if (matched) {
-                build_str(ti->cpuset_dir, sizeof(ti->cpuset_dir), matched->cpuset_dir, NULL);
-                ti->bind_after_ms = delay_deadline(proc->detected_at_ms, matched->delay_ms);
+                ensure_cpuset_dir(&ti->cpus, &cfg->topo, ti->cpuset_dir,
+                                  sizeof(ti->cpuset_dir));
+                ti->bind_after_ms = delay_deadline(proc->detected_at_ms, matched_delay_ms);
             } else {
                 ti->cpus = proc->base_cpus;
                 build_str(ti->cpuset_dir, sizeof(ti->cpuset_dir), proc->base_cpuset, NULL);
@@ -955,7 +1194,7 @@ static void* config_loader_thread(void* arg) {
     free(arg);
     pthread_setname_np(pthread_self(), "ConfigLoader");
 
-    time_t last_mtime = -1;
+    struct timespec last_mtime = { .tv_sec = -1, .tv_nsec = -1 };
     while (1) {
         if (inotify_supported) {
             fd_set rfds;
@@ -999,7 +1238,7 @@ static void* config_loader_thread(void* arg) {
                         if (cfg) {
                             inotify_rm_watch(inotify_fd, inotify_wd);
                             inotify_wd = inotify_add_watch(inotify_fd, cfg->config_file, IN_CLOSE_WRITE | IN_DELETE_SELF | IN_MOVE_SELF);
-                            last_mtime = -1;
+                            last_mtime = (struct timespec){ .tv_sec = -1, .tv_nsec = -1 };
                             config_release(cfg);
                         }
                         if (inotify_wd < 0) {
@@ -1047,18 +1286,24 @@ static void print_help(const char* prog_name) {
     printf("Options:\n");
     printf("  -c <config_file>   指定配置文件 (默认: ./applist.conf)\n");
     printf("  -s <interval>      设置检查间隔(秒) (必须>=1, 默认: 2)\n");
+    printf("  -b <cpuset_name>   指定 cpuset 目录名 (默认: AppOpt)\n");
     printf("  -v                 显示程序版本\n");
     printf("  -h                 显示帮助信息\n");
     printf("\n示例:\n");
     printf("  %s -c /data/applist.conf -s 3\n", prog_name);
+    printf("  %s -b MyAppOpt\n", prog_name);
+    printf("\nCPU 规格支持数字范围及 e-core、p-core、hp-core、all-core。\n");
+    printf("块规则示例:\n");
+    printf("  com.example {\n");
+    printf("    RenderThread=hp-core\n");
+    printf("  }\n");
 }
 
 int main(int argc, char **argv) {
-    CpuTopology topo = init_cpu_topo();
     char config_file[4096] = "./applist.conf";
     int sleep_interval = 2;
     int opt;
-    while ((opt = getopt(argc, argv, "c:s:hv")) != -1) {
+    while ((opt = getopt(argc, argv, "c:s:b:hv")) != -1) {
         switch (opt) {
             case 'c':
                 build_str(config_file, sizeof(config_file), optarg, NULL);
@@ -1077,6 +1322,14 @@ int main(int argc, char **argv) {
                 printf("检查间隔: %d 秒\n", sleep_interval);
                 break;
             }
+            case 'b':
+                if (!set_base_cpuset(optarg)) {
+                    fprintf(stderr, "无效的 cpuset 目录名: %s\n", optarg);
+                    fprintf(stderr, "仅允许字母、数字、点、下划线和连字符，且不能为 . 或 ..\n");
+                    exit(EXIT_FAILURE);
+                }
+                printf("cpuset 目录: %s\n", base_cpuset);
+                break;
             case 'v':
                 printf("AppOpt 版本 %s\n", VERSION);
                 exit(EXIT_SUCCESS);
@@ -1088,6 +1341,8 @@ int main(int argc, char **argv) {
                 exit(EXIT_FAILURE);
         }
     }
+
+    CpuTopology topo = init_cpu_topo();
 
     struct stat st;
     if (stat(config_file, &st) != 0) {
