@@ -514,7 +514,7 @@ static uint32_t calculate_pattern_priority(const char* pattern) {
 }
 
 static bool pattern_has_wildcards(const char* pattern) {
-    return pattern && strpbrk(pattern, *?[) != NULL;
+    return pattern && strpbrk(pattern, "*?[") != NULL;
 }
 
 static bool rule_is_more_specific(const AffinityRule* candidate,
