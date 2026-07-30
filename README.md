@@ -61,7 +61,7 @@ AppOpt [选项]
 选项:
   -c <路径>    指定配置文件路径（默认: ./applist.conf）
   -s <秒>      设置检查间隔，必须 ≥ 1（默认: 2）
-  -b <名称>    指定 /dev/cpuset 下的目录名（默认: AppOpt）
+  -b <名称>    指定 /dev/cpuset 下的目录名（默认: AkiAppOpt）
   -v           显示版本信息
   -h           显示帮助
 
@@ -134,7 +134,7 @@ com.example {
 
 ```
 ┌─────────────┐     ┌──────────────┐     ┌─────────────────────┐
-│ applist.conf │ ──▶ │ 规则解析器    │ ──▶ │ /dev/cpuset/AppOpt/    │
+│ applist.conf │ ──▶ │ 规则解析器    │ ──▶ │ /dev/cpuset/AkiAppOpt/ │
 └─────────────┘     └──────────────┘     │   ├── 4-6/           │
                                          │   ├── 7/             │
        ┌─────────────────────┐           │   └── 6-7/           │
@@ -147,7 +147,7 @@ com.example {
 └──────────┘     └──────────────┘     └───────────────────────┘
 ```
 
-1. 服务启动时解析 `applist.conf`，在 `/dev/cpuset/AppOpt/` 下创建对应 cpuset 分组
+1. 服务启动时解析 `applist.conf`，在 `/dev/cpuset/AkiAppOpt/` 下创建对应 cpuset 分组
 2. 周期性扫描 `/proc`，通过 PID 跟踪与增量扫描机制降低开销
 3. 将匹配线程的 PID 写入对应 cpuset 的 `tasks` 文件，同时调用 `sched_setaffinity()` 设置 CPU 亲和性
 4. inotify 事件驱动配置文件热加载，自动回退到轮询模式作为兼容方案

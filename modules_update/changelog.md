@@ -11,7 +11,7 @@
 - 构建流程升级为完整的 Magisk 模块打包，支持 `arm64-v8a`、`armabi-v7a` 和 `x86_64`。
 
 #### 改进
-- 模块安装目录保持为 `AkiAppOpt`；运行时 cpuset 默认使用 `/dev/cpuset/AppOpt`，可通过 `-b` 覆盖。
+- 模块安装目录和运行时 cpuset 默认名称统一为 `AkiAppOpt`，cpuset 名称仍可通过 `-b` 覆盖。
 - 更新模块时保留用户现有的 `applist.conf`。
 - 配置格式错误、CPU 范围无效或规则过长时跳过该规则，并输出无效规则数量。
 - 重构规则添加和包名去重逻辑，减少重复处理。

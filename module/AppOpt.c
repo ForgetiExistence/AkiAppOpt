@@ -22,7 +22,7 @@
 
 #define VERSION            "aki-0.2.0"
 #define CPUSET_ROOT        "/dev/cpuset"
-#define DEFAULT_CPUSET     "AppOpt"
+#define DEFAULT_CPUSET     "AkiAppOpt"
 #define BASE_CPUSET_MAX    256
 #define MAX_PKG_LEN        128
 #define MAX_THREAD_LEN     32
@@ -1286,7 +1286,7 @@ static void print_help(const char* prog_name) {
     printf("Options:\n");
     printf("  -c <config_file>   指定配置文件 (默认: ./applist.conf)\n");
     printf("  -s <interval>      设置检查间隔(秒) (必须>=1, 默认: 2)\n");
-    printf("  -b <cpuset_name>   指定 cpuset 目录名 (默认: AppOpt)\n");
+    printf("  -b <cpuset_name>   指定 cpuset 目录名 (默认: AkiAppOpt)\n");
     printf("  -v                 显示程序版本\n");
     printf("  -h                 显示帮助信息\n");
     printf("\n示例:\n");
