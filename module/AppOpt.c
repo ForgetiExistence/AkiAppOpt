@@ -35,6 +35,8 @@ typedef struct {
     char cpuset_dir[256];
     cpu_set_t cpus;
     uint64_t delay_ms;
+    uint32_t package_priority;
+    uint32_t thread_priority;
 } AffinityRule;
 
 typedef struct {
@@ -488,6 +490,35 @@ typedef enum {
     RULE_ADD_NO_MEMORY
 } RuleAddResult;
 
+static uint32_t calculate_pattern_priority(const char* pattern) {
+    if (!pattern || !*pattern) return 0;
+
+    uint32_t literal_count = 0;
+    bool has_range = false;
+    bool has_question = false;
+    bool has_star = false;
+    for (const unsigned char* cursor = (const unsigned char*)pattern; *cursor; cursor++) {
+        if (*cursor == '[') has_range = true;
+        else if (*cursor == '?') has_question = true;
+        else if (*cursor == '*') has_star = true;
+        else literal_count++;
+    }
+
+    uint32_t pattern_class = !has_range && !has_question && !has_star ? 4U :
+                             has_range ? 3U : has_question ? 2U : 1U;
+    return (pattern_class << 16) | literal_count;
+}
+
+static bool rule_is_more_specific(const AffinityRule* candidate,
+                                  const AffinityRule* selected,
+                                  bool compare_thread) {
+    if (!selected) return true;
+    if (compare_thread && candidate->thread_priority != selected->thread_priority) {
+        return candidate->thread_priority > selected->thread_priority;
+    }
+    return candidate->package_priority > selected->package_priority;
+}
+
 static RuleAddResult add_rule(AffinityRule** rules, size_t* rules_cnt,
                               const CpuTopology* topo, const char* pkg,
                               const char* thread, const char* cpus_spec,
@@ -513,6 +544,8 @@ static RuleAddResult add_rule(AffinityRule** rules, size_t* rules_cnt,
 
     rule.cpus = set;
     rule.delay_ms = delay_ms;
+    rule.package_priority = calculate_pattern_priority(rule.pkg);
+    rule.thread_priority = calculate_pattern_priority(rule.thread);
 
     AffinityRule* tmp = realloc(*rules, (*rules_cnt + 1) * sizeof(AffinityRule));
     if (!tmp) return RULE_ADD_NO_MEMORY;
@@ -879,6 +912,7 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
             proc->thread_rules_cap = new_cap;
         }
 
+        const AffinityRule* base_rule = NULL;
         for (size_t i = 0; i < cfg->num_rules; i++) {
             const AffinityRule* rule = &cfg->rules[i];
             if (fnmatch(rule->pkg, proc->pkg, FNM_NOESCAPE) != 0) continue;
@@ -892,15 +926,16 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
                     proc->thread_rules_cap = new_cap;
                 }
                 proc->thread_rules[proc->num_thread_rules++] = (AffinityRule*)rule;
-            } else {
-                CPU_OR(&proc->base_cpus, &proc->base_cpus, &rule->cpus);
-                if (rule->delay_ms > proc->base_delay_ms) proc->base_delay_ms = rule->delay_ms;
+            } else if (rule_is_more_specific(rule, base_rule, false)) {
+                base_rule = rule;
             }
         }
 
-        if (CPU_COUNT(&proc->base_cpus) > 0) {
-            ensure_cpuset_dir(&proc->base_cpus, &cfg->topo, proc->base_cpuset,
-                              sizeof(proc->base_cpuset));
+        if (base_rule) {
+            proc->base_cpus = base_rule->cpus;
+            proc->base_delay_ms = base_rule->delay_ms;
+            build_str(proc->base_cpuset, sizeof(proc->base_cpuset),
+                      base_rule->cpuset_dir, NULL);
         }
 
         if (CPU_COUNT(&proc->base_cpus) == 0 && proc->num_thread_rules == 0) {
@@ -955,22 +990,22 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
             ti->tid = tid;
             build_str(ti->name, sizeof(ti->name), tname, NULL);
             CPU_ZERO(&ti->cpus);
-            bool matched = false;
-            uint64_t matched_delay_ms = 0;
+            const AffinityRule* matched_rule = NULL;
 
             for (size_t i = 0; i < proc->num_thread_rules; i++) {
                 const AffinityRule* rule = proc->thread_rules[i];
-                if (fnmatch(rule->thread, ti->name, FNM_NOESCAPE) == 0) {
-                    CPU_OR(&ti->cpus, &ti->cpus, &rule->cpus);
-                    if (rule->delay_ms > matched_delay_ms) matched_delay_ms = rule->delay_ms;
-                    matched = true;
+                if (fnmatch(rule->thread, ti->name, FNM_NOESCAPE) == 0 &&
+                    rule_is_more_specific(rule, matched_rule, true)) {
+                    matched_rule = rule;
                 }
             }
 
-            if (matched) {
+            if (matched_rule) {
+                ti->cpus = matched_rule->cpus;
                 ensure_cpuset_dir(&ti->cpus, &cfg->topo, ti->cpuset_dir,
                                   sizeof(ti->cpuset_dir));
-                ti->bind_after_ms = delay_deadline(proc->detected_at_ms, matched_delay_ms);
+                ti->bind_after_ms = delay_deadline(proc->detected_at_ms,
+                                                   matched_rule->delay_ms);
             } else {
                 ti->cpus = proc->base_cpus;
                 build_str(ti->cpuset_dir, sizeof(ti->cpuset_dir), proc->base_cpuset, NULL);
