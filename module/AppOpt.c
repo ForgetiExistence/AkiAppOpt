@@ -829,7 +829,7 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
 
         bool found = false;
         for (size_t j = 0; j < cfg->num_pkgs; j++) {
-            if (strcmp(name, cfg->pkgs[j]) == 0) {
+            if (fnmatch(cfg->pkgs[j], name, FNM_NOESCAPE) == 0) {
                 found = true;
                 break;
             }
@@ -881,7 +881,7 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
 
         for (size_t i = 0; i < cfg->num_rules; i++) {
             const AffinityRule* rule = &cfg->rules[i];
-            if (strcmp(rule->pkg, proc->pkg) != 0) continue;
+            if (fnmatch(rule->pkg, proc->pkg, FNM_NOESCAPE) != 0) continue;
 
             if (rule->thread[0]) {
                 if (proc->num_thread_rules >= proc->thread_rules_cap) {
