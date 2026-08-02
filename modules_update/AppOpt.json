@@ -1,6 +1,6 @@
 {
-  "version": "Aki-0.2.0",
-  "versionCode": 0,
-  "zipUrl": "https://github.com/AkiHaza/AkiAppOpt/actions",
+  "version": "Aki-1.0.0(196-282a19e)",
+  "versionCode": 196,
+  "zipUrl": "https://github.com/AkiHaza/AkiAppOpt/releases/download/1.0.0/AppOpt-Aki-1.0.0.zip",
   "changelog": "https://raw.githubusercontent.com/AkiHaza/AkiAppOpt/Dev/modules_update/changelog.md"
 }
