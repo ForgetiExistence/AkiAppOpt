@@ -1,3 +1,35 @@
+MODDIR=${0%/*}
+PID_FILE="$MODDIR/AppOpt.pid"
+
+is_appopt_process() {
+	[ -n "$1" ] && [ -r "/proc/$1/cmdline" ] || return 1
+	PROCESS_CMD=$(tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null)
+	case "$PROCESS_CMD" in
+		"$MODDIR/AppOpt"*) return 0 ;;
+	esac
+	return 1
+}
+
+stop_late_load_instance() {
+	if command -v pidof >/dev/null 2>&1; then
+		APP_OPT_PIDS=$(pidof AppOpt 2>/dev/null)
+	elif [ -f "$PID_FILE" ]; then
+		APP_OPT_PIDS=$(cat "$PID_FILE" 2>/dev/null)
+	fi
+
+	for APP_OPT_PID in $APP_OPT_PIDS; do
+		is_appopt_process "$APP_OPT_PID" || continue
+		kill "$APP_OPT_PID" 2>/dev/null || continue
+		i=5
+		while kill -0 "$APP_OPT_PID" 2>/dev/null && [ "$i" -gt 0 ]; do
+			i=$((i-1))
+			sleep 1
+		done
+		kill -9 "$APP_OPT_PID" 2>/dev/null
+	done
+	rm -f "$PID_FILE"
+}
+
 wait_sys_boot_completed() {
 	local i=9
 	until [ "$(getprop sys.boot_completed)" == "1" ] || [ $i -le 0 ]; do
@@ -5,9 +37,13 @@ wait_sys_boot_completed() {
 		sleep 9
 	done
 }
+
+# KernelSU late-load 软启动后重建 AppOpt，正常启动模式不进入此分支。
+if [ "$KSU_LATE_LOAD" = "1" ]; then
+	stop_late_load_instance
+fi
+
 wait_sys_boot_completed
-MODDIR=${0%/*}
-PID_FILE="$MODDIR/AppOpt.pid"
 
 if [ ! -x "$MODDIR/AppOpt" ]; then
 	exit 1
@@ -15,11 +51,8 @@ fi
 
 if [ -f "$PID_FILE" ]; then
 	OLD_PID=$(cat "$PID_FILE" 2>/dev/null)
-	if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
-		OLD_CMD=$(tr '\0' ' ' < "/proc/$OLD_PID/cmdline" 2>/dev/null)
-		case "$OLD_CMD" in
-			"$MODDIR/AppOpt"*) APP_OPT_RUNNING=1 ;;
-		esac
+	if is_appopt_process "$OLD_PID"; then
+		APP_OPT_RUNNING=1
 	fi
 fi
 
