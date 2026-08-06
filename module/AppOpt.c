@@ -472,17 +472,18 @@ static CpuTopology init_cpu_topo(void) {
 
     if (access("/dev/cpuset", F_OK) != 0) return topo;
 
-    if (create_cpuset_dir(base_cpuset, topo.present_str, "0")) {
-        topo.base_cpuset_fd = open(base_cpuset, O_RDONLY | O_DIRECTORY);
-        if (topo.base_cpuset_fd != -1) topo.cpuset_enabled = true;
-    }
-
-    char mems_path[256];
-    build_str(mems_path, sizeof(mems_path), base_cpuset, "/mems", NULL);
-    if (!read_file(AT_FDCWD, mems_path, topo.mems_str, sizeof(topo.mems_str))) {
+    if (!read_file(AT_FDCWD, "/dev/cpuset/mems", topo.mems_str, sizeof(topo.mems_str))) {
         build_str(topo.mems_str, sizeof(topo.mems_str), "0", NULL);
     } else {
         strtrim(topo.mems_str);
+        if (!topo.mems_str[0]) {
+            build_str(topo.mems_str, sizeof(topo.mems_str), "0", NULL);
+        }
+    }
+
+    if (create_cpuset_dir(base_cpuset, topo.present_str, topo.mems_str)) {
+        topo.base_cpuset_fd = open(base_cpuset, O_RDONLY | O_DIRECTORY);
+        if (topo.base_cpuset_fd != -1) topo.cpuset_enabled = true;
     }
 
     return topo;
@@ -948,12 +949,23 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
         if (pid_fd == -1) continue;
 
         char cmd[MAX_PKG_LEN] = {0};
-        if (!read_file(pid_fd, "cmdline", cmd, sizeof(cmd))) {
+        bool from_cmdline = read_file(pid_fd, "cmdline", cmd, sizeof(cmd));
+        char* name = NULL;
+        if (from_cmdline) {
+            name = strrchr(cmd, '/');
+            name = strtrim(name ? name + 1 : cmd);
+        }
+        if (!name || !*name) {
+            if (!read_file(pid_fd, "comm", cmd, sizeof(cmd))) {
+                close(pid_fd);
+                continue;
+            }
+            name = strtrim(cmd);
+        }
+        if (!*name) {
             close(pid_fd);
             continue;
         }
-        char* name = strrchr(cmd, '/');
-        name = name ? name + 1 : cmd;
 
         if (!package_index_matches(cfg, name)) {
             close(pid_fd);
