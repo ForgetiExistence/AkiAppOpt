@@ -57,7 +57,7 @@ if [ -f "$PID_FILE" ]; then
 fi
 
 if [ "$APP_OPT_RUNNING" != "1" ]; then
-	nohup "$MODDIR/AppOpt" -c "$MODDIR/applist.conf" >/dev/null 2>&1 &
+	nohup "$MODDIR/AppOpt" -c "$MODDIR/applist.conf" -g "$MODDIR/gamelist.conf" >/dev/null 2>&1 &
 	echo $! > "$PID_FILE"
 fi
 
