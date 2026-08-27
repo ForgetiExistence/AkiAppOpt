@@ -9,7 +9,7 @@ on:
         default: Dev
         type: string
   push:
-    branches: [Dev, main]
+    branches: [Dev, main, fuxi-8g2]
     paths: [module/**, .github/workflows/build.yml]
   pull_request:
     paths: [module/**, .github/workflows/build.yml]
