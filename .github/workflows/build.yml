@@ -21,7 +21,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      NDK_VERSION: r27c
       MODULE_DIR: module
       OUTPUT_NAME: AppOpt
       MAGISK_INSTALLER_REV: 14ea5cfb4a5771c742f7c3fd1e685bdbfac7aa8c
@@ -43,10 +42,16 @@ jobs:
             -e "s/^versionCode=.*/versionCode=${count}/" \
             "$MODULE_DIR/module.prop"
 
-      - uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: ${{ env.NDK_VERSION }}
-          local-cache: true
+      - name: Setup Android NDK (official r27c)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 -o ndk.zip "https://dl.google.com/android/repository/android-ndk-r27c-linux.zip"
+          unzip -q ndk.zip -d "$RUNNER_TEMP/ndk"
+          rm -f ndk.zip
+          echo "ANDROID_NDK_HOME=$RUNNER_TEMP/ndk/android-ndk-r27c" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/ndk/android-ndk-r27c/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" --version | head -1
 
       - name: Build binaries
         shell: bash
